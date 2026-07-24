@@ -2,7 +2,6 @@ package auth
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -77,9 +76,9 @@ type Session struct {
 }
 
 func NewSession(server string, dialContext ...func(context.Context, string, string) (net.Conn, error)) *Session {
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}
+	// Leave TLS verification enabled. The Android client must reject an
+	// untrusted certificate or a hostname mismatch before credentials are sent.
+	tr := &http.Transport{}
 	if len(dialContext) > 0 && dialContext[0] != nil {
 		tr.DialContext = dialContext[0]
 	}
