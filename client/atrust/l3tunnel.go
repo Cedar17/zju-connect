@@ -12,6 +12,8 @@ import (
 
 type L3Tunnel struct {
 	client *Client
+	closeOnce sync.Once
+	closeCh   chan struct{}
 
 	ip net.IP
 
@@ -31,6 +33,7 @@ func NewL3Tunnel(aTrustClient *Client) (*L3Tunnel, error) {
 		client:   aTrustClient,
 		conns:    make(map[string]*l3TunnelConn),
 		dataChan: make(chan []byte, 4096),
+		closeCh:  make(chan struct{}),
 	}
 
 	ipResources, err := aTrustClient.IPResources()
@@ -55,20 +58,29 @@ func (t *L3Tunnel) updateVIP(ips []net.IP) {
 }
 
 func (t *L3Tunnel) Close() {
-	t.connsMu.Lock()
-	conns := make([]*l3TunnelConn, 0, len(t.conns))
-	for _, conn := range t.conns {
-		conns = append(conns, conn)
-	}
-	t.conns = make(map[string]*l3TunnelConn)
-	t.connsMu.Unlock()
+	t.closeOnce.Do(func() {
+		close(t.closeCh)
+		t.connsMu.Lock()
+		conns := make([]*l3TunnelConn, 0, len(t.conns))
+		for _, conn := range t.conns {
+			conns = append(conns, conn)
+		}
+		t.conns = make(map[string]*l3TunnelConn)
+		t.connsMu.Unlock()
 
-	for _, conn := range conns {
-		_ = conn.Close()
-	}
+		for _, conn := range conns {
+			_ = conn.Close()
+		}
+	})
 }
 
 func (t *L3Tunnel) getConn(nodeGroupID string) (*l3TunnelConn, error) {
+	select {
+	case <-t.closeCh:
+		return nil, net.ErrClosed
+	default:
+	}
+
 	t.connsMu.Lock()
 	if conn := t.conns[nodeGroupID]; conn != nil {
 		t.connsMu.Unlock()
@@ -124,6 +136,10 @@ func (t *L3Tunnel) forwardFromConn(nodeGroupID string, conn *l3TunnelConn) {
 			return
 		}
 		logPacket("recv", pkt)
-		t.dataChan <- pkt
+		select {
+		case t.dataChan <- pkt:
+		case <-t.closeCh:
+			return
+		}
 	}
 }
