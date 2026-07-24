@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"syscall"
 	"time"
 
 	tun "github.com/mythologyli/sing-tun"
@@ -16,12 +17,20 @@ import (
 // Dialer creates connections on the interface that was used to reach the VPN
 // server before the TUN interface was installed. This prevents VPN underlay
 // connections from being captured by the TUN interface itself.
+// SocketProtector is implemented by Android's VpnService. It is called after
+// the socket is created and before it connects, so the underlay cannot be
+// captured by the VPN interface.
+type SocketProtector interface {
+	Protect(socketFD int) bool
+}
+
 type Dialer struct {
-	mu            sync.RWMutex
-	interfaceName string
-	autoDetect    bool
-	excludedIPs   []net.IP
-	requireBound  bool
+	mu              sync.RWMutex
+	interfaceName   string
+	autoDetect      bool
+	excludedIPs     []net.IP
+	requireBound    bool
+	socketProtector SocketProtector
 }
 
 type Options struct {
@@ -29,6 +38,7 @@ type Options struct {
 	// It takes precedence over AutoDetect.
 	InterfaceName string
 	AutoDetect    bool
+	SocketProtector SocketProtector
 }
 
 func (d *Dialer) DialTLSContext(ctx context.Context, network, address string, config *tls.Config) (*tls.Conn, error) {
@@ -57,12 +67,16 @@ func New(serverAddress string, options ...Options) *Dialer {
 		option = options[0]
 	}
 	if option.InterfaceName != "" {
-		return &Dialer{interfaceName: option.InterfaceName}
+		return &Dialer{interfaceName: option.InterfaceName, socketProtector: option.SocketProtector}
 	}
 	if !option.AutoDetect {
-		return &Dialer{}
+		return &Dialer{socketProtector: option.SocketProtector}
 	}
-	return &Dialer{interfaceName: detectInterface(serverAddress), autoDetect: true}
+	return &Dialer{
+		interfaceName:   detectInterface(serverAddress),
+		autoDetect:      true,
+		socketProtector: option.SocketProtector,
+	}
 }
 
 func (d *Dialer) InterfaceName() string {
@@ -72,6 +86,17 @@ func (d *Dialer) InterfaceName() string {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return d.interfaceName
+}
+
+// SetSocketProtector installs the Android underlay protection boundary after
+// the VPN interface has been established.
+func (d *Dialer) SetSocketProtector(protector SocketProtector) {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	d.socketProtector = protector
+	d.mu.Unlock()
 }
 
 // ExcludeIP prevents an interface carrying ip from being selected as the
@@ -95,7 +120,16 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 	interfaceName := d.interfaceName
 	autoDetect := d.autoDetect
 	requireBound := d.requireBound
+	socketProtector := d.socketProtector
 	d.mu.RUnlock()
+
+	// Once Android has established its VPN interface, VpnService.protect is
+	// the authoritative underlay boundary. It also avoids relying on
+	// SO_BINDTODEVICE permissions inside an ordinary Android app.
+	if socketProtector != nil {
+		return dialWithSocketProtector(ctx, network, address, socketProtector)
+	}
+
 	if autoDetect && requireBound && interfaceName == "" {
 		interfaceName = d.refreshInterface("")
 		if interfaceName == "" {
@@ -126,6 +160,23 @@ func dialContextOnInterface(ctx context.Context, network, address, interfaceName
 		if err := bindInterface(nd, interfaceName); err != nil {
 			return nil, fmt.Errorf("bind underlay interface %q: %w", interfaceName, err)
 		}
+	}
+	return nd.DialContext(ctx, network, address)
+}
+
+func dialWithSocketProtector(ctx context.Context, network, address string, protector SocketProtector) (net.Conn, error) {
+	nd := &net.Dialer{
+		ControlContext: func(_ context.Context, _, _ string, rawConn syscall.RawConn) error {
+			var protectErr error
+			if err := rawConn.Control(func(fd uintptr) {
+				if !protector.Protect(int(fd)) {
+					protectErr = fmt.Errorf("VpnService.protect returned false")
+				}
+			}); err != nil {
+				return err
+			}
+			return protectErr
+		},
 	}
 	return nd.DialContext(ctx, network, address)
 }
