@@ -63,6 +63,16 @@ func NewClient(username, sid, deviceID, signKey string) *Client {
 	}
 }
 
+// SetSocketProtector installs the Android VPN underlay protection boundary.
+// Setup intentionally runs before the TUN exists, so callers attach the
+// protector immediately after VpnService establishes the TUN.
+func (c *Client) SetSocketProtector(protector underlay.SocketProtector) {
+	if c == nil || c.underlayDialer == nil {
+		return
+	}
+	c.underlayDialer.SetSocketProtector(protector)
+}
+
 func (c *Client) Close() {
 	c.closeOnce.Do(func() {
 		c.lifecycleCancel()
