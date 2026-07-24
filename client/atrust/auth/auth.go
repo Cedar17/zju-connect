@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mythologyli/zju-connect/log"
@@ -58,8 +59,11 @@ type ClientAuthData struct {
 }
 
 type Session struct {
-	client   *http.Client
-	deviceID string
+	client            *http.Client
+	requestContext    context.Context
+	cancelRequests    context.CancelFunc
+	connectionTracker *connectionTracker
+	deviceID          string
 
 	baseHost string
 	baseURL  string
@@ -78,21 +82,107 @@ type Session struct {
 func NewSession(server string, dialContext ...func(context.Context, string, string) (net.Conn, error)) *Session {
 	// Leave TLS verification enabled. The Android client must reject an
 	// untrusted certificate or a hostname mismatch before credentials are sent.
-	tr := &http.Transport{}
+	baseDialContext := (&net.Dialer{}).DialContext
 	if len(dialContext) > 0 && dialContext[0] != nil {
-		tr.DialContext = dialContext[0]
+		baseDialContext = dialContext[0]
 	}
+	connectionTracker := newConnectionTracker(baseDialContext)
+	tr := &http.Transport{DialContext: connectionTracker.dialContext}
 	jar, _ := cookiejar.New(nil)
 	client := &http.Client{Transport: tr, Jar: jar, Timeout: 20 * time.Second}
+	requestContext, cancelRequests := context.WithCancel(context.Background())
 
 	rid := base64.StdEncoding.EncodeToString([]byte(server))
 
 	return &Session{
-		client:   client,
-		baseHost: server,
-		baseURL:  "https://" + server,
-		rid:      rid,
-		response: make(map[string]json.RawMessage),
+		client:            client,
+		requestContext:    requestContext,
+		cancelRequests:    cancelRequests,
+		connectionTracker: connectionTracker,
+		baseHost:          server,
+		baseURL:           "https://" + server,
+		rid:               rid,
+		response:          make(map[string]json.RawMessage),
+	}
+}
+
+// do binds every authentication request to the session lifetime. Cancelling
+// the session interrupts active dials, TLS handshakes, and response reads;
+// unlike CloseIdleConnections alone, it does not wait for the HTTP timeout.
+func (s *Session) do(request *http.Request) (*http.Response, error) {
+	return s.client.Do(request.WithContext(s.requestContext))
+}
+
+// cancel interrupts all requests made by this session. It is safe to call
+// repeatedly and is intentionally package-private: the interactive Android
+// flow owns the decision to discard an authentication session.
+func (s *Session) cancel() {
+	s.cancelRequests()
+	s.connectionTracker.closeAll()
+	s.client.CloseIdleConnections()
+}
+
+type connectionTracker struct {
+	mu          sync.Mutex
+	closed      bool
+	connections map[*trackedConn]struct{}
+	dial        func(context.Context, string, string) (net.Conn, error)
+}
+
+type trackedConn struct {
+	net.Conn
+	release func()
+}
+
+func (connection *trackedConn) Close() error {
+	err := connection.Conn.Close()
+	connection.release()
+	return err
+}
+
+func newConnectionTracker(dial func(context.Context, string, string) (net.Conn, error)) *connectionTracker {
+	return &connectionTracker{
+		connections: make(map[*trackedConn]struct{}),
+		dial:        dial,
+	}
+}
+
+func (tracker *connectionTracker) dialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	connection, err := tracker.dial(ctx, network, address)
+	if err != nil {
+		return nil, err
+	}
+
+	var tracked *trackedConn
+	tracked = &trackedConn{
+		Conn: connection,
+		release: func() {
+			tracker.mu.Lock()
+			delete(tracker.connections, tracked)
+			tracker.mu.Unlock()
+		},
+	}
+	tracker.mu.Lock()
+	if tracker.closed {
+		tracker.mu.Unlock()
+		_ = connection.Close()
+		return nil, context.Canceled
+	}
+	tracker.connections[tracked] = struct{}{}
+	tracker.mu.Unlock()
+	return tracked, nil
+}
+
+func (tracker *connectionTracker) closeAll() {
+	tracker.mu.Lock()
+	tracker.closed = true
+	connections := make([]*trackedConn, 0, len(tracker.connections))
+	for connection := range tracker.connections {
+		connections = append(connections, connection)
+	}
+	tracker.mu.Unlock()
+	for _, connection := range connections {
+		_ = connection.Close()
 	}
 }
 

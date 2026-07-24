@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 )
 
 // InteractivePrompt is a single safe-to-display step in an aTrust login. It
@@ -77,7 +78,8 @@ type InteractiveFlow struct {
 	captcha     []byte
 	purpose     captchaPurpose
 	result      *InteractiveResult
-	cancelled   bool
+	cancelOnce  sync.Once
+	cancelled   atomic.Bool
 }
 
 func NewInteractiveFlow(server string, dialContext ...func(context.Context, string, string) (net.Conn, error)) (*InteractiveFlow, error) {
@@ -211,6 +213,9 @@ func (f *InteractiveFlow) SubmitSMSCode(code string) (InteractivePrompt, error) 
 // PendingCaptchaImage returns a defensive copy. The image is cleared when the
 // challenge is submitted, cancelled, or replaced by another challenge.
 func (f *InteractiveFlow) PendingCaptchaImage() ([]byte, error) {
+	if f.cancelled.Load() {
+		return nil, fmt.Errorf("captcha image is not available")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.state != interactiveAwaitingCaptcha || len(f.captcha) == 0 {
@@ -245,12 +250,21 @@ func (f *InteractiveFlow) SubmitCaptcha(raw string) (InteractivePrompt, error) {
 }
 
 func (f *InteractiveFlow) Cancel() {
+	// A network operation holds f.mu while it uses the credential fields. Do
+	// not wait for that operation here: cancel its request context first, then
+	// scrub state as soon as the now-interrupted operation releases the lock.
+	f.cancelled.Store(true)
+	f.session.cancel()
+	f.cancelOnce.Do(func() {
+		go f.finalizeCancellation()
+	})
+}
+
+func (f *InteractiveFlow) finalizeCancellation() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.cancelled = true
 	f.state = interactiveCancelled
 	f.clearSensitiveState()
-	f.session.client.CloseIdleConnections()
 }
 
 func (f *InteractiveFlow) ClearResult() {
@@ -260,6 +274,9 @@ func (f *InteractiveFlow) ClearResult() {
 }
 
 func (f *InteractiveFlow) Result() (InteractiveResult, bool) {
+	if f.cancelled.Load() {
+		return InteractiveResult{}, false
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.result == nil {
@@ -424,6 +441,7 @@ func sessionSID(session *Session) string {
 }
 
 func (f *InteractiveFlow) clearCredentials() {
+	f.username = ""
 	f.password = ""
 	f.smsCode = ""
 }

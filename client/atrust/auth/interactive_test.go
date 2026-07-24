@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestNewSessionRejectsUntrustedCertificate(t *testing.T) {
@@ -100,9 +101,91 @@ func TestInteractiveFlowRejectsOutOfOrderInput(t *testing.T) {
 	}
 }
 
+func TestInteractiveFlowCancelInterruptsActiveRequestAndClearsState(t *testing.T) {
+	requestStarted := make(chan struct{})
+	requestRelease := make(chan struct{})
+	server := newInteractiveTestServer(t, interactiveScenario{
+		blockPassword:   true,
+		passwordStarted: requestStarted,
+		passwordRelease: requestRelease,
+	})
+	defer server.Close()
+	defer close(requestRelease)
+
+	flow := newTrustedFlow(t, server)
+	if _, err := flow.Begin(); err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	if _, err := flow.SelectMethod("auth/psw", "Radius"); err != nil {
+		t.Fatalf("SelectMethod: %v", err)
+	}
+
+	operationDone := make(chan error, 1)
+	go func() {
+		_, err := flow.SubmitCredentials("student", "password")
+		operationDone <- err
+	}()
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("password request did not start")
+	}
+
+	startedAt := time.Now()
+	flow.Cancel()
+	if elapsed := time.Since(startedAt); elapsed > 250*time.Millisecond {
+		t.Fatalf("Cancel blocked for %s", elapsed)
+	}
+	flow.session.connectionTracker.mu.Lock()
+	connections := len(flow.session.connectionTracker.connections)
+	flow.session.connectionTracker.mu.Unlock()
+	if connections != 0 {
+		t.Fatalf("Cancel left %d active authentication connections", connections)
+	}
+	select {
+	case err := <-operationDone:
+		if err == nil {
+			t.Fatal("cancelled password request unexpectedly succeeded")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("authentication operation did not return after cancellation")
+	}
+
+	if _, ok := flow.Result(); ok {
+		t.Fatal("cancelled request retained an authentication result")
+	}
+	waitForInteractiveCancellation(t, flow)
+}
+
+func waitForInteractiveCancellation(t *testing.T, flow *InteractiveFlow) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		flow.mu.Lock()
+		cleared := flow.state == interactiveCancelled &&
+			flow.username == "" &&
+			flow.password == "" &&
+			flow.phone == "" &&
+			flow.smsCode == "" &&
+			len(flow.captcha) == 0 &&
+			flow.result == nil
+		flow.mu.Unlock()
+		if cleared {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("cancelled flow did not clear its sensitive state")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 type interactiveScenario struct {
-	captcha      bool
-	secondarySMS bool
+	captcha         bool
+	secondarySMS    bool
+	blockPassword   bool
+	passwordStarted chan struct{}
+	passwordRelease <-chan struct{}
 }
 
 func newTrustedFlow(t *testing.T, server *httptest.Server) *InteractiveFlow {
@@ -149,6 +232,11 @@ func newInteractiveTestServer(t *testing.T, scenario interactiveScenario) *httpt
 				}},
 			}})
 		case "/passport/v1/auth/psw":
+			if scenario.blockPassword {
+				close(scenario.passwordStarted)
+				<-scenario.passwordRelease
+				return
+			}
 			mu.Lock()
 			passwordAttempts++
 			attempt := passwordAttempts
