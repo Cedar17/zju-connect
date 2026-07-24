@@ -17,8 +17,12 @@ func (c *L3Conn) Read(p []byte) (n int, err error) {
 	defer c.recvLock.Unlock()
 	var data []byte
 	var ok bool
-	data, ok = <-c.l3Tunnel.dataChan
-	if !ok {
+	select {
+	case data, ok = <-c.l3Tunnel.dataChan:
+		if !ok {
+			return 0, io.EOF
+		}
+	case <-c.l3Tunnel.closeCh:
 		return 0, io.EOF
 	}
 	n = copy(p, data)
@@ -35,7 +39,10 @@ func (c *L3Conn) Write(p []byte) (n int, err error) {
 }
 
 func (c *L3Conn) Close() error {
-	// TODO: implement close logic
+	if c == nil || c.l3Tunnel == nil {
+		return nil
+	}
+	c.l3Tunnel.Close()
 	return nil
 }
 
