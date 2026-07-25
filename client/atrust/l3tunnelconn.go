@@ -601,7 +601,12 @@ func readDataRespPayload(r *bufio.Reader) ([]byte, string, error) {
 		return nil, "", err
 	}
 	payloadLen := int(binary.BigEndian.Uint16(peek))
-	if payloadLen > 0 && payloadLen <= maxDataPayload {
+	// The protocol has two data-response encodings. The token-envelope form
+	// starts with a one-byte token length, so its first two bytes can also look
+	// like a small big-endian packet length. Do not select the raw-packet form
+	// from that ambiguous length alone: it causes token metadata to be injected
+	// into Android's TUN as if it were an IPv4 packet.
+	if payloadLen > 0 && payloadLen <= maxDataPayload && hasIPv4PayloadHeader(r, payloadLen) {
 		if _, err := r.Discard(2); err != nil {
 			return nil, "", err
 		}
@@ -653,6 +658,29 @@ func readDataRespPayload(r *bufio.Reader) ([]byte, string, error) {
 		payload = append(payload, pkt...)
 	}
 	return payload, "token", nil
+}
+
+// hasIPv4PayloadHeader proves that the bytes after a raw data-frame length
+// are a complete IPv4 packet of exactly that length. It peeks only the IPv4
+// fixed header, so an ambiguous token frame cannot make the reader wait for a
+// fictitious multi-kilobyte payload.
+func hasIPv4PayloadHeader(r *bufio.Reader, payloadLen int) bool {
+	if payloadLen < 20 {
+		return false
+	}
+	frame, err := r.Peek(2 + 20)
+	if err != nil {
+		return false
+	}
+	header := frame[2:]
+	if header[0]>>4 != 4 {
+		return false
+	}
+	headerLen := int(header[0]&0x0f) * 4
+	if headerLen < 20 || headerLen > payloadLen {
+		return false
+	}
+	return int(binary.BigEndian.Uint16(header[2:4])) == payloadLen
 }
 
 func parseDataMeta(payload []byte) (packetMeta, int, error) {
