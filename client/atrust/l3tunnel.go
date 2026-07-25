@@ -11,7 +11,7 @@ import (
 )
 
 type L3Tunnel struct {
-	client *Client
+	client    *Client
 	closeOnce sync.Once
 	closeCh   chan struct{}
 
@@ -106,7 +106,15 @@ func (t *L3Tunnel) getConn(nodeGroupID string) (*l3TunnelConn, error) {
 	}
 	ctx, cancel := context.WithTimeout(t.client.lifecycleCtx, 10*time.Second)
 	defer cancel()
-	conn, err := newL3TunnelConn(ctx, t.client.underlayDialer.DialTLSContext, addr, info, t.client.SignKey, t.updateVIP)
+	conn, err := newL3TunnelConn(
+		ctx,
+		t.client.underlayDialer.DialTLSContext,
+		addr,
+		t.client.nodeTLSConfigForDial(),
+		info,
+		t.client.SignKey,
+		t.updateVIP,
+	)
 	if err != nil {
 		return nil, err
 	}

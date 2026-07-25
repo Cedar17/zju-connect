@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -49,6 +50,8 @@ type Client struct {
 	lifecycleCancel context.CancelFunc
 	closeOnce       sync.Once
 	underlayDialer  *underlay.Dialer
+	nodeTLSMu       sync.RWMutex
+	nodeTLSConfig   *tls.Config
 }
 
 func NewClient(username, sid, deviceID, signKey string) *Client {
@@ -71,6 +74,38 @@ func (c *Client) SetSocketProtector(protector underlay.SocketProtector) {
 		return
 	}
 	c.underlayDialer.SetSocketProtector(protector)
+}
+
+// SetNodeTLSConfig configures TLS for connections to the aTrust data-plane
+// nodes. A nil config restores the standard Go TLS verification policy. The
+// configuration is cloned so callers can safely reuse or modify their copy.
+//
+// This is deliberately separate from the HTTPS authentication server: aTrust
+// installations can advertise node IP addresses whose TLS trust policy is
+// different from the portal's public certificate.
+func (c *Client) SetNodeTLSConfig(config *tls.Config) {
+	if c == nil {
+		return
+	}
+	c.nodeTLSMu.Lock()
+	defer c.nodeTLSMu.Unlock()
+	if config == nil {
+		c.nodeTLSConfig = nil
+		return
+	}
+	c.nodeTLSConfig = config.Clone()
+}
+
+func (c *Client) nodeTLSConfigForDial() *tls.Config {
+	if c == nil {
+		return &tls.Config{}
+	}
+	c.nodeTLSMu.RLock()
+	defer c.nodeTLSMu.RUnlock()
+	if c.nodeTLSConfig == nil {
+		return &tls.Config{}
+	}
+	return c.nodeTLSConfig.Clone()
 }
 
 func (c *Client) Close() {
