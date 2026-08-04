@@ -43,7 +43,7 @@
 
 3. 解除安全限制：`sudo xattr -rd com.apple.quarantine zju-connect`。
 
-4. 参考 [com.zju.connect.plist](com.zju.connect.plist) 建立 macOS 系统服务配置文件，plist 文件为二进制文件，建议使用 PlistEdict Pro 编辑，其中关键配置参数如下：
+4. 参考 [com.zju.connect.plist](../com.zju.connect.plist) 建立 macOS 系统服务配置文件，plist 文件为二进制文件，建议使用 PlistEdict Pro 编辑，其中关键配置参数如下：
 
     + `UserName`: 后台运行 zju-connect 的的用户默认为 `root`，建议修改为你自己的用户名
     + `ProgramArguments`: zju-connect 运行参数

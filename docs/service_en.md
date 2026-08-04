@@ -43,7 +43,7 @@ For macOS, system services are based on `launchd`, which is different from `syst
 
 3. Remove security restrictions: `sudo xattr -rd com.apple.quarantine zju-connect`.
 
-4. Create `plist` file referring to [com.zju.connect.plist](com.zju.connect.plist). Since `plist` is a binary file, it's recommended to edit using PlistEdict Pro. Here are some key configurations:
+4. Create `plist` file referring to [com.zju.connect.plist](../com.zju.connect.plist). Since `plist` is a binary file, it's recommended to edit using PlistEdict Pro. Here are some key configurations:
 
     + `UserName`: The default user for running zju-connect in the background is `root`, it's recommended to change to your own username.
     + `ProgramArguments`: zju-connect running parameters.
