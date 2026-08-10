@@ -56,6 +56,7 @@ type l3TunnelConn struct {
 	info         clientInfo
 	onVIP        func([]net.IP)
 	vipRequested uint32
+	dataMode     string
 }
 
 type authIP struct {
@@ -188,6 +189,7 @@ func (c *l3TunnelConn) Close() error {
 }
 
 func (c *l3TunnelConn) readLoop() {
+	var lengthDataRemainder []byte
 	for {
 		fr, err := c.readFrame()
 		if err != nil {
@@ -199,10 +201,26 @@ func (c *l3TunnelConn) readLoop() {
 		switch fr.cmd {
 		case cmdDataResp:
 			if fr.dataMode == "len" {
-				log.DebugPrintf("l3-tunnel recv data packet len=%d", len(fr.payload))
-				select {
-				case c.incoming <- fr.payload:
-				case <-c.closeCh:
+				lengthDataRemainder = append(lengthDataRemainder, fr.payload...)
+				packets, remainder, err := parseLengthDataStream(lengthDataRemainder)
+				if err != nil {
+					log.DebugPrintf("l3-tunnel parse length data stream failed: %v", err)
+					_ = c.Close()
+					return
+				}
+				lengthDataRemainder = remainder
+				log.DebugPrintf(
+					"l3-tunnel recv length data packets=%d payloadLen=%d remainderLen=%d",
+					len(packets),
+					len(fr.payload),
+					len(lengthDataRemainder),
+				)
+				for _, pkt := range packets {
+					select {
+					case c.incoming <- pkt:
+					case <-c.closeCh:
+						return
+					}
 				}
 				continue
 			}
@@ -277,10 +295,11 @@ func (c *l3TunnelConn) readFrame() (frame, error) {
 				return frame{cmd: cmd, status: status, payload: payload}, nil
 			}
 			if cmd == cmdDataResp {
-				payload, mode, err := readDataRespPayload(c.reader)
+				payload, mode, err := readDataRespPayload(c.reader, c.dataMode)
 				if err != nil {
 					return frame{}, err
 				}
+				c.dataMode = mode
 				raw := append(append([]byte{}, header...), payload...)
 				logFrame("recv", raw)
 				log.DebugPrintf("l3-tunnel recv data resp mode=%s payloadLen=%d", mode, len(payload))
@@ -595,7 +614,40 @@ func parseDataPayload(payload []byte) ([][]byte, error) {
 	return packets, nil
 }
 
-func readDataRespPayload(r *bufio.Reader) ([]byte, string, error) {
+func parseLengthDataStream(payload []byte) ([][]byte, []byte, error) {
+	packets := make([][]byte, 0, 1)
+	for len(payload) > 0 {
+		if len(payload) < 20 {
+			return packets, append([]byte(nil), payload...), nil
+		}
+		if payload[0]>>4 != 4 {
+			return nil, nil, fmt.Errorf("unexpected ip version %d", payload[0]>>4)
+		}
+		headerLen := int(payload[0]&0x0f) * 4
+		if headerLen < 20 || headerLen > len(payload) {
+			return nil, nil, fmt.Errorf("invalid ipv4 header length %d", headerLen)
+		}
+		packetLen := int(binary.BigEndian.Uint16(payload[2:4]))
+		if packetLen < headerLen {
+			return nil, nil, fmt.Errorf("invalid ipv4 packet length %d", packetLen)
+		}
+		if packetLen > len(payload) {
+			return packets, append([]byte(nil), payload...), nil
+		}
+		packet := make([]byte, packetLen)
+		copy(packet, payload[:packetLen])
+		packets = append(packets, packet)
+		payload = payload[packetLen:]
+	}
+	return packets, nil, nil
+}
+
+func readDataRespPayload(r *bufio.Reader, establishedMode string) ([]byte, string, error) {
+	if establishedMode == "token" {
+		payload, err := readTokenDataRespPayload(r)
+		return payload, "token", err
+	}
+
 	peek, err := r.Peek(2)
 	if err != nil {
 		return nil, "", err
@@ -603,10 +655,15 @@ func readDataRespPayload(r *bufio.Reader) ([]byte, string, error) {
 	payloadLen := int(binary.BigEndian.Uint16(peek))
 	// The protocol has two data-response encodings. The token-envelope form
 	// starts with a one-byte token length, so its first two bytes can also look
-	// like a small big-endian packet length. Do not select the raw-packet form
-	// from that ambiguous length alone: it causes token metadata to be injected
-	// into Android's TUN as if it were an IPv4 packet.
-	if payloadLen > 0 && payloadLen <= maxDataPayload && hasIPv4PayloadHeader(r, payloadLen) {
+	// like a small big-endian payload length. A length-prefixed response may
+	// contain several concatenated IPv4 packets, so the first packet's total
+	// length only needs to fit inside the outer payload length.
+	isLengthPayload := establishedMode == "len" ||
+		(payloadLen > 0 && payloadLen <= maxDataPayload && hasIPv4PayloadStart(r, payloadLen))
+	if isLengthPayload {
+		if payloadLen <= 0 || payloadLen > maxDataPayload {
+			return nil, "", fmt.Errorf("invalid length data payload size %d", payloadLen)
+		}
 		if _, err := r.Discard(2); err != nil {
 			return nil, "", err
 		}
@@ -618,33 +675,37 @@ func readDataRespPayload(r *bufio.Reader) ([]byte, string, error) {
 		}
 		return payload, "len", nil
 	}
+	payload, err := readTokenDataRespPayload(r)
+	return payload, "token", err
+}
 
+func readTokenDataRespPayload(r *bufio.Reader) ([]byte, error) {
 	tokenLen, err := r.ReadByte()
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	payload := []byte{tokenLen}
 	if tokenLen > 0 {
 		token := make([]byte, int(tokenLen))
 		if _, err := io.ReadFull(r, token); err != nil {
-			return nil, "", err
+			return nil, err
 		}
 		payload = append(payload, token...)
 	}
 	reserved := make([]byte, 2)
 	if _, err := io.ReadFull(r, reserved); err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	payload = append(payload, reserved...)
 	count, err := r.ReadByte()
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	payload = append(payload, count)
 	for i := 0; i < int(count); i++ {
 		lenBytes := make([]byte, 2)
 		if _, err := io.ReadFull(r, lenBytes); err != nil {
-			return nil, "", err
+			return nil, err
 		}
 		payload = append(payload, lenBytes...)
 		plen := int(binary.BigEndian.Uint16(lenBytes))
@@ -653,18 +714,18 @@ func readDataRespPayload(r *bufio.Reader) ([]byte, string, error) {
 		}
 		pkt := make([]byte, plen)
 		if _, err := io.ReadFull(r, pkt); err != nil {
-			return nil, "", err
+			return nil, err
 		}
 		payload = append(payload, pkt...)
 	}
-	return payload, "token", nil
+	return payload, nil
 }
 
-// hasIPv4PayloadHeader proves that the bytes after a raw data-frame length
-// are a complete IPv4 packet of exactly that length. It peeks only the IPv4
+// hasIPv4PayloadStart proves that the bytes after a data-frame length begin
+// with a complete IPv4 packet that fits inside that frame. It peeks only the
 // fixed header, so an ambiguous token frame cannot make the reader wait for a
 // fictitious multi-kilobyte payload.
-func hasIPv4PayloadHeader(r *bufio.Reader, payloadLen int) bool {
+func hasIPv4PayloadStart(r *bufio.Reader, payloadLen int) bool {
 	if payloadLen < 20 {
 		return false
 	}
@@ -673,14 +734,16 @@ func hasIPv4PayloadHeader(r *bufio.Reader, payloadLen int) bool {
 		return false
 	}
 	header := frame[2:]
-	if header[0]>>4 != 4 {
+	version := header[0] >> 4
+	headerLen := int(header[0]&0x0f) * 4
+	packetLen := int(binary.BigEndian.Uint16(header[2:4]))
+	if version != 4 {
 		return false
 	}
-	headerLen := int(header[0]&0x0f) * 4
 	if headerLen < 20 || headerLen > payloadLen {
 		return false
 	}
-	return int(binary.BigEndian.Uint16(header[2:4])) == payloadLen
+	return packetLen >= headerLen && packetLen <= payloadLen
 }
 
 func parseDataMeta(payload []byte) (packetMeta, int, error) {
