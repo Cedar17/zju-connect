@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -84,6 +85,75 @@ func TestInteractiveFlowPasswordCaptchaAndSecondarySMS(t *testing.T) {
 	prompt, err = flow.SubmitSMSCode("123456")
 	if err != nil || prompt.State != string(interactiveAuthenticated) {
 		t.Fatalf("SubmitSMSCode = %#v, %v", prompt, err)
+	}
+}
+
+func TestInteractiveFlowResumesAuthenticatedSessionAndRefreshesCookies(t *testing.T) {
+	server := newInteractiveTestServer(t, interactiveScenario{alreadyLoggedIn: true})
+	defer server.Close()
+
+	flow := newTrustedFlow(t, server)
+	host := strings.TrimPrefix(server.URL, "https://")
+	authData, err := json.Marshal(ClientAuthData{
+		DeviceID: "ABCDEF0123456789ABCDEF0123456789",
+		Cookies: []Cookie{
+			{Host: host, Scheme: "https", Name: "sid", Value: "stored-session-cookie"},
+			{Host: host, Scheme: "https", Name: "sid.sig", Value: "stored-signature"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Marshal auth data: %v", err)
+	}
+
+	prompt, err := flow.Resume(authData)
+	if err != nil || prompt.State != string(interactiveAuthenticated) {
+		t.Fatalf("Resume() = %#v, %v", prompt, err)
+	}
+	result, ok := flow.Result()
+	if !ok || result.Username != "student" || result.SID != "refreshed-session-cookie" || len(result.ResourceData) == 0 {
+		t.Fatalf("Result() = %#v, %v", result, ok)
+	}
+	var refreshed ClientAuthData
+	if err := json.Unmarshal(result.AuthData, &refreshed); err != nil {
+		t.Fatalf("Unmarshal refreshed auth data: %v", err)
+	}
+	if refreshed.DeviceID != "ABCDEF0123456789ABCDEF0123456789" {
+		t.Fatalf("device ID changed during resume: %q", refreshed.DeviceID)
+	}
+	if got := cookieValue(refreshed.Cookies, "sid"); got != "refreshed-session-cookie" {
+		t.Fatalf("refreshed sid = %q", got)
+	}
+}
+
+func TestInteractiveFlowClassifiesRejectedSession(t *testing.T) {
+	server := newInteractiveTestServer(t, interactiveScenario{})
+	defer server.Close()
+
+	flow := newTrustedFlow(t, server)
+	host := strings.TrimPrefix(server.URL, "https://")
+	authData, err := json.Marshal(ClientAuthData{
+		DeviceID: "0123456789abcdef0123456789abcdef",
+		Cookies:  []Cookie{{Host: host, Scheme: "https", Name: "sid", Value: "expired-session-cookie"}},
+	})
+	if err != nil {
+		t.Fatalf("Marshal auth data: %v", err)
+	}
+
+	if _, err := flow.Resume(authData); !errors.Is(err, ErrSessionInvalid) {
+		t.Fatalf("Resume error = %v, want ErrSessionInvalid", err)
+	}
+	if _, ok := flow.Result(); ok {
+		t.Fatal("rejected session produced an authentication result")
+	}
+}
+
+func TestInteractiveFlowRejectsIncompleteSessionBeforeNetworking(t *testing.T) {
+	server := newInteractiveTestServer(t, interactiveScenario{})
+	defer server.Close()
+	flow := newTrustedFlow(t, server)
+
+	if _, err := flow.Resume([]byte(`{"cookies":[]}`)); err == nil {
+		t.Fatal("incomplete authentication session was accepted")
 	}
 }
 
@@ -183,6 +253,7 @@ func waitForInteractiveCancellation(t *testing.T, flow *InteractiveFlow) {
 type interactiveScenario struct {
 	captcha         bool
 	secondarySMS    bool
+	alreadyLoggedIn bool
 	blockPassword   bool
 	passwordStarted chan struct{}
 	passwordRelease <-chan struct{}
@@ -221,6 +292,17 @@ func newInteractiveTestServer(t *testing.T, scenario interactiveScenario) *httpt
 		}
 		switch request.URL.Path {
 		case "/passport/v1/public/authConfig":
+			if scenario.alreadyLoggedIn {
+				if cookie, err := request.Cookie("sid"); err != nil || cookie.Value != "stored-session-cookie" {
+					t.Errorf("resume authConfig sid cookie = %#v, %v", cookie, err)
+				}
+				http.SetCookie(writer, &http.Cookie{Name: "sid", Value: "refreshed-session-cookie", Path: "/"})
+				writeJSON(map[string]any{"data": map[string]any{
+					"isLogin":   1,
+					"csrfToken": "csrf",
+				}})
+				return
+			}
 			writeJSON(map[string]any{"data": map[string]any{
 				"isLogin":        0,
 				"csrfToken":      "csrf",
@@ -281,6 +363,15 @@ func newInteractiveTestServer(t *testing.T, scenario interactiveScenario) *httpt
 			writer.WriteHeader(http.StatusNotFound)
 		}
 	}))
+}
+
+func cookieValue(cookies []Cookie, name string) string {
+	for _, cookie := range cookies {
+		if cookie.Name == name {
+			return cookie.Value
+		}
+	}
+	return ""
 }
 
 func captchaImage(t *testing.T) []byte {

@@ -128,6 +128,72 @@ func (f *InteractiveFlow) Begin() (InteractivePrompt, error) {
 	}, nil
 }
 
+// Resume validates previously persisted authentication data with the server
+// and rebuilds the same in-memory result produced by an interactive login.
+// Only cookies and the exact device ID are restored; username, SID, and
+// resources are fetched again after the server confirms that the session is
+// still authenticated.
+func (f *InteractiveFlow) Resume(authData []byte) (InteractivePrompt, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.state != interactiveNew {
+		return InteractivePrompt{}, fmt.Errorf("authentication flow already started")
+	}
+
+	var clientAuthData ClientAuthData
+	if err := json.Unmarshal(authData, &clientAuthData); err != nil {
+		return InteractivePrompt{}, fmt.Errorf("decode authentication session: %w", err)
+	}
+	if clientAuthData.DeviceID == "" || len(clientAuthData.Cookies) == 0 {
+		return InteractivePrompt{}, fmt.Errorf("authentication session is incomplete")
+	}
+	hasSID := false
+	for _, cookie := range clientAuthData.Cookies {
+		if cookie.Host != f.session.baseHost || cookie.Scheme != "https" || cookie.Name == "" || cookie.Value == "" {
+			return InteractivePrompt{}, fmt.Errorf("authentication session contains an invalid cookie")
+		}
+		if cookie.Name == "sid" {
+			hasSID = true
+		}
+	}
+	if !hasSID {
+		return InteractivePrompt{}, fmt.Errorf("authentication session does not contain sid")
+	}
+
+	f.deviceID = clientAuthData.DeviceID
+	loginResult, err := f.session.Login(nil, LoginOptions{
+		DeviceID: clientAuthData.DeviceID,
+		Cookies:  append([]Cookie(nil), clientAuthData.Cookies...),
+	})
+	if err != nil {
+		return InteractivePrompt{}, err
+	}
+	resourceData, err := f.session.ClientResource()
+	if err != nil {
+		return InteractivePrompt{}, err
+	}
+	currentAuthData, err := json.Marshal(ClientAuthData{
+		Cookies:  sessionCookies(f.session),
+		DeviceID: clientAuthData.DeviceID,
+	})
+	if err != nil {
+		return InteractivePrompt{}, err
+	}
+	sid := sessionSID(f.session)
+	if sid == "" {
+		return InteractivePrompt{}, fmt.Errorf("restored authentication session does not contain sid")
+	}
+	f.result = &InteractiveResult{
+		Username:     loginResult.Username,
+		SID:          sid,
+		AuthData:     currentAuthData,
+		ResourceData: resourceData,
+	}
+	f.clearCredentials()
+	f.state = interactiveAuthenticated
+	return InteractivePrompt{State: string(f.state), Message: "Authentication session restored"}, nil
+}
+
 func (f *InteractiveFlow) SelectMethod(authType, loginDomain string) (InteractivePrompt, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

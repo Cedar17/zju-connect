@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	mathrand "math/rand"
 	"net"
@@ -23,6 +24,11 @@ const (
 	maxAttempts  = 5
 	maxAuthSteps = 8
 )
+
+// ErrSessionInvalid means the server explicitly rejected a restored session.
+// Callers may discard persisted authentication state only for this error; a
+// transport or TLS failure does not prove that the session has expired.
+var ErrSessionInvalid = errors.New("aTrust session is not authenticated")
 
 var sharedParams = url.Values{
 	"clientType": {"SDPClient"},
@@ -381,7 +387,7 @@ func (s *Session) Login(method LoginMethod, opts LoginOptions) (LoginResult, err
 	}
 
 	if method == nil {
-		return LoginResult{}, fmt.Errorf("login method is nil, but user is not logged in")
+		return LoginResult{}, ErrSessionInvalid
 	}
 	var foundAuthInfo *AuthInfo
 	for _, authInfo := range authInfoList {
