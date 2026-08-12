@@ -7,7 +7,6 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -125,7 +124,7 @@ func TestInteractiveFlowResumesAuthenticatedSessionAndRefreshesCookies(t *testin
 	}
 }
 
-func TestInteractiveFlowClassifiesRejectedSession(t *testing.T) {
+func TestInteractiveFlowContinuesRejectedSessionWithSameIdentity(t *testing.T) {
 	server := newInteractiveTestServer(t, interactiveScenario{})
 	defer server.Close()
 
@@ -139,11 +138,88 @@ func TestInteractiveFlowClassifiesRejectedSession(t *testing.T) {
 		t.Fatalf("Marshal auth data: %v", err)
 	}
 
-	if _, err := flow.Resume(authData); !errors.Is(err, ErrSessionInvalid) {
-		t.Fatalf("Resume error = %v, want ErrSessionInvalid", err)
+	prompt, err := flow.Resume(authData)
+	if err != nil || prompt.State != string(interactiveAwaitingMethod) || prompt.Code != "sessionExpired" {
+		t.Fatalf("Resume() = %#v, %v, want recoverable method prompt", prompt, err)
 	}
 	if _, ok := flow.Result(); ok {
 		t.Fatal("rejected session produced an authentication result")
+	}
+}
+
+func TestInteractiveFlowUsesCallerDeviceIDDuringResume(t *testing.T) {
+	server := newInteractiveTestServer(t, interactiveScenario{alreadyLoggedIn: true})
+	defer server.Close()
+
+	host := strings.TrimPrefix(server.URL, "https://")
+	const expectedDeviceID = "11111111111111111111111111111111"
+	flow, err := NewInteractiveFlowWithDeviceID(host, expectedDeviceID)
+	if err != nil {
+		t.Fatalf("NewInteractiveFlowWithDeviceID: %v", err)
+	}
+	trustInteractiveFlow(t, flow, server)
+	authData, err := json.Marshal(ClientAuthData{
+		DeviceID: "22222222222222222222222222222222",
+		Cookies:  []Cookie{{Host: host, Scheme: "https", Name: "sid", Value: "stored-session-cookie"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := flow.Resume(authData); err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	result, ok := flow.Result()
+	if !ok {
+		t.Fatal("Resume did not produce a result")
+	}
+	var refreshed ClientAuthData
+	if err := json.Unmarshal(result.AuthData, &refreshed); err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.DeviceID != expectedDeviceID {
+		t.Fatalf("device ID = %q, want caller identity", refreshed.DeviceID)
+	}
+}
+
+func TestInteractiveFlowReturnsRecoverableCredentialRejection(t *testing.T) {
+	server := newInteractiveTestServer(t, interactiveScenario{rejectPassword: true})
+	defer server.Close()
+
+	flow := newTrustedFlow(t, server)
+	if _, err := flow.Begin(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := flow.SelectMethod("auth/psw", "Radius"); err != nil {
+		t.Fatal(err)
+	}
+	prompt, err := flow.SubmitCredentials("student", "wrong")
+	if err != nil || prompt.State != string(interactiveAwaitingCredentials) || prompt.Code != "credentialsRejected" {
+		t.Fatalf("SubmitCredentials() = %#v, %v", prompt, err)
+	}
+}
+
+func TestInteractiveFlowExposesServerTokenChallenges(t *testing.T) {
+	for _, service := range []string{"auth/totp", "auth/radius", "auth/challenge"} {
+		t.Run(service, func(t *testing.T) {
+			server := newInteractiveTestServer(t, interactiveScenario{secondaryService: service})
+			defer server.Close()
+
+			flow := newTrustedFlow(t, server)
+			if _, err := flow.Begin(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := flow.SelectMethod("auth/psw", "Radius"); err != nil {
+				t.Fatal(err)
+			}
+			prompt, err := flow.SubmitCredentials("student", "correct")
+			if err != nil || prompt.State != string(interactiveAwaitingToken) || prompt.ChallengeKind != service {
+				t.Fatalf("SubmitCredentials() = %#v, %v", prompt, err)
+			}
+			prompt, err = flow.SubmitToken("123456")
+			if err != nil || prompt.State != string(interactiveAuthenticated) {
+				t.Fatalf("SubmitToken() = %#v, %v", prompt, err)
+			}
+		})
 	}
 }
 
@@ -251,25 +327,34 @@ func waitForInteractiveCancellation(t *testing.T, flow *InteractiveFlow) {
 }
 
 type interactiveScenario struct {
-	captcha         bool
-	secondarySMS    bool
-	alreadyLoggedIn bool
-	blockPassword   bool
-	passwordStarted chan struct{}
-	passwordRelease <-chan struct{}
+	captcha          bool
+	secondarySMS     bool
+	secondaryService string
+	alreadyLoggedIn  bool
+	blockPassword    bool
+	rejectPassword   bool
+	passwordStarted  chan struct{}
+	passwordRelease  <-chan struct{}
 }
 
 func newTrustedFlow(t *testing.T, server *httptest.Server) *InteractiveFlow {
 	t.Helper()
-	flow, err := NewInteractiveFlow(strings.TrimPrefix(server.URL, "https://"))
+	host := strings.TrimPrefix(server.URL, "https://")
+	flow, err := NewInteractiveFlow(host)
 	if err != nil {
 		t.Fatalf("NewInteractiveFlow: %v", err)
 	}
+	trustInteractiveFlow(t, flow, server)
+	return flow
+}
+
+func trustInteractiveFlow(t *testing.T, flow *InteractiveFlow, server *httptest.Server) {
+	t.Helper()
+	host := strings.TrimPrefix(server.URL, "https://")
 	pool := x509.NewCertPool()
 	pool.AddCert(server.Certificate())
-	transport := flow.session.client.Transport.(*http.Transport)
-	transport.TLSClientConfig = &tls.Config{RootCAs: pool}
-	return flow
+	flow.newSession = func() *Session { return newSession(host, &tls.Config{RootCAs: pool}) }
+	flow.session = flow.newSession()
 }
 
 func newInteractiveTestServer(t *testing.T, scenario interactiveScenario) *httptest.Server {
@@ -319,6 +404,10 @@ func newInteractiveTestServer(t *testing.T, scenario interactiveScenario) *httpt
 				<-scenario.passwordRelease
 				return
 			}
+			if scenario.rejectPassword {
+				writeJSON(map[string]any{"code": 1001, "message": "invalid credentials", "data": map[string]any{"graphCheckCodeEnable": 0}})
+				return
+			}
 			mu.Lock()
 			passwordAttempts++
 			attempt := passwordAttempts
@@ -344,8 +433,12 @@ func newInteractiveTestServer(t *testing.T, scenario interactiveScenario) *httpt
 			data := map[string]any{}
 			if scenario.secondarySMS {
 				data["nextService"] = "auth/sms"
+			} else if scenario.secondaryService != "" {
+				data["nextService"] = scenario.secondaryService
 			}
 			writeJSON(map[string]any{"code": 0, "data": data})
+		case "/passport/v1/auth/token", "/passport/v1/auth/challenge":
+			writeJSON(map[string]any{"code": 0, "data": map[string]any{}})
 		case "/passport/v1/public/phoneNumber":
 			writeJSON(map[string]any{"code": 0, "data": map[string]any{"phoneNumber": "138****0000"}})
 		case "/passport/v1/auth/sms":

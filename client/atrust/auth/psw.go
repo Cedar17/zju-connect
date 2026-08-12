@@ -107,7 +107,7 @@ func (s *Session) pswImpl(username, password, loginDomain, graphCheckCode string
 		if re.Data.GraphCheckCodeEnable == 1 {
 			return re.Data.GraphCheckCodeEnable, nil
 		}
-		return 0, fmt.Errorf("password authentication failed with code %d: %s", re.Code, re.Message)
+		return 0, fmt.Errorf("%w: code %d: %s", ErrCredentialsRejected, re.Code, re.Message)
 	}
 	log.DebugPrintf("Parsed psw: %+v", re)
 

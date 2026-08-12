@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -19,7 +20,9 @@ import (
 // credentials. Callers use the matching InteractiveFlow method to continue.
 type InteractivePrompt struct {
 	State         string     `json:"state"`
+	Code          string     `json:"code,omitempty"`
 	Message       string     `json:"message"`
+	ChallengeKind string     `json:"challengeKind,omitempty"`
 	AuthMethods   []AuthInfo `json:"authMethods,omitempty"`
 	PhoneNumbers  []string   `json:"phoneNumbers,omitempty"`
 	CaptchaWidth  int        `json:"captchaWidth,omitempty"`
@@ -44,6 +47,7 @@ const (
 	interactiveAwaitingPhone       interactiveState = "awaitingPhone"
 	interactiveAwaitingSMS         interactiveState = "awaitingSms"
 	interactiveAwaitingCaptcha     interactiveState = "awaitingCaptcha"
+	interactiveAwaitingToken       interactiveState = "awaitingToken"
 	interactiveAuthenticated       interactiveState = "authenticated"
 	interactiveCancelled           interactiveState = "cancelled"
 )
@@ -62,11 +66,13 @@ const (
 type InteractiveFlow struct {
 	mu sync.Mutex
 
-	session  *Session
-	deviceID string
-	state    interactiveState
-	methods  []AuthInfo
-	selected *AuthInfo
+	session        *Session
+	newSession     func() *Session
+	deviceID       string
+	deviceIDLocked bool
+	state          interactiveState
+	methods        []AuthInfo
+	selected       *AuthInfo
 
 	username string
 	password string
@@ -87,11 +93,30 @@ func NewInteractiveFlow(server string, dialContext ...func(context.Context, stri
 	if err != nil {
 		return nil, fmt.Errorf("generate device id: %w", err)
 	}
+	return newInteractiveFlow(server, deviceID, false, dialContext...), nil
+}
+
+// NewInteractiveFlowWithDeviceID creates an interactive flow whose device
+// identity is owned by the caller. Restored snapshots cannot replace it.
+func NewInteractiveFlowWithDeviceID(server, deviceID string, dialContext ...func(context.Context, string, string) (net.Conn, error)) (*InteractiveFlow, error) {
+	if len(deviceID) != 32 {
+		return nil, fmt.Errorf("device id must contain 32 hexadecimal characters")
+	}
+	if _, err := hex.DecodeString(deviceID); err != nil {
+		return nil, fmt.Errorf("device id is not hexadecimal: %w", err)
+	}
+	return newInteractiveFlow(server, deviceID, true, dialContext...), nil
+}
+
+func newInteractiveFlow(server, deviceID string, locked bool, dialContext ...func(context.Context, string, string) (net.Conn, error)) *InteractiveFlow {
+	newSession := func() *Session { return NewSession(server, dialContext...) }
 	return &InteractiveFlow{
-		session:  NewSession(server, dialContext...),
-		deviceID: deviceID,
-		state:    interactiveNew,
-	}, nil
+		session:        newSession(),
+		newSession:     newSession,
+		deviceID:       deviceID,
+		deviceIDLocked: locked,
+		state:          interactiveNew,
+	}
 }
 
 func randomDeviceID() (string, error) {
@@ -110,6 +135,10 @@ func (f *InteractiveFlow) Begin() (InteractivePrompt, error) {
 		return InteractivePrompt{}, fmt.Errorf("authentication flow already started")
 	}
 
+	return f.begin("")
+}
+
+func (f *InteractiveFlow) begin(code string) (InteractivePrompt, error) {
 	f.session.deviceID = f.deviceID
 	f.session.env = base64.StdEncoding.EncodeToString([]byte(`{"deviceId":"` + f.deviceID + `"}`))
 	_, methods, err := f.session.authConfig(false, true)
@@ -123,6 +152,7 @@ func (f *InteractiveFlow) Begin() (InteractivePrompt, error) {
 	f.state = interactiveAwaitingMethod
 	return InteractivePrompt{
 		State:       string(f.state),
+		Code:        code,
 		Message:     "Choose an authentication method",
 		AuthMethods: append([]AuthInfo(nil), f.methods...),
 	}, nil
@@ -160,12 +190,20 @@ func (f *InteractiveFlow) Resume(authData []byte) (InteractivePrompt, error) {
 		return InteractivePrompt{}, fmt.Errorf("authentication session does not contain sid")
 	}
 
-	f.deviceID = clientAuthData.DeviceID
+	if !f.deviceIDLocked {
+		f.deviceID = clientAuthData.DeviceID
+	}
 	loginResult, err := f.session.Login(nil, LoginOptions{
-		DeviceID: clientAuthData.DeviceID,
+		DeviceID: f.deviceID,
 		Cookies:  append([]Cookie(nil), clientAuthData.Cookies...),
 	})
 	if err != nil {
+		if errors.Is(err, ErrSessionInvalid) {
+			f.session.cancel()
+			f.session = f.newSession()
+			f.state = interactiveNew
+			return f.begin("sessionExpired")
+		}
 		return InteractivePrompt{}, err
 	}
 	resourceData, err := f.session.ClientResource()
@@ -174,7 +212,7 @@ func (f *InteractiveFlow) Resume(authData []byte) (InteractivePrompt, error) {
 	}
 	currentAuthData, err := json.Marshal(ClientAuthData{
 		Cookies:  sessionCookies(f.session),
-		DeviceID: clientAuthData.DeviceID,
+		DeviceID: f.deviceID,
 	})
 	if err != nil {
 		return InteractivePrompt{}, err
@@ -276,6 +314,48 @@ func (f *InteractiveFlow) SubmitSMSCode(code string) (InteractivePrompt, error) 
 	return f.advance(step)
 }
 
+// SubmitToken continues a server-selected TOTP, RADIUS, token, or challenge
+// step. The token remains in memory only for the duration of the request.
+func (f *InteractiveFlow) SubmitToken(token string) (InteractivePrompt, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.state != interactiveAwaitingToken {
+		return InteractivePrompt{}, fmt.Errorf("authentication token is not expected")
+	}
+	if token == "" {
+		return InteractivePrompt{}, fmt.Errorf("authentication token is required")
+	}
+
+	token, skipSecondaryAuth := parseTokenInput(token)
+	payload := map[string]interface{}{"skipSecondaryAuth": skipSecondaryAuth}
+	var (
+		step authStep
+		err  error
+	)
+	switch f.pendingStep.Service {
+	case "auth/totp":
+		payload["action"] = "auth"
+		payload["totpToken"] = token
+		payload["isPrevEffect"] = false
+		f.session.addUsername(payload)
+		step, err = f.session.submitToken(payload)
+	case "auth/radius", "auth/token":
+		payload["radiusToken"] = token
+		f.session.addUsername(payload)
+		step, err = f.session.submitTokenAt("auth/token", payload)
+	case "auth/challenge":
+		payload["radiusToken"] = token
+		f.session.addUsername(payload)
+		step, err = f.session.submitTokenAt("auth/challenge", payload)
+	default:
+		return InteractivePrompt{}, fmt.Errorf("unsupported authentication token service: %s", f.pendingStep.Service)
+	}
+	if err != nil {
+		return InteractivePrompt{}, err
+	}
+	return f.advance(step)
+}
+
 // PendingCaptchaImage returns a defensive copy. The image is cleared when the
 // challenge is submitted, cancelled, or replaced by another challenge.
 func (f *InteractiveFlow) PendingCaptchaImage() ([]byte, error) {
@@ -359,6 +439,15 @@ func (f *InteractiveFlow) Result() (InteractiveResult, bool) {
 func (f *InteractiveFlow) passwordAttempt(graphCheckCode string) (InteractivePrompt, error) {
 	enabled, err := f.session.pswImpl(f.username, f.password, f.selected.LoginDomain, graphCheckCode)
 	if err != nil {
+		if errors.Is(err, ErrCredentialsRejected) {
+			f.clearCredentials()
+			f.state = interactiveAwaitingCredentials
+			return InteractivePrompt{
+				State:   string(f.state),
+				Code:    "credentialsRejected",
+				Message: "The saved account credentials were rejected",
+			}, nil
+		}
 		return InteractivePrompt{}, err
 	}
 	if enabled == 1 {
@@ -441,6 +530,11 @@ func (f *InteractiveFlow) advance(step authStep) (InteractivePrompt, error) {
 			if err := f.session.authSms(step); err != nil {
 				return InteractivePrompt{}, err
 			}
+			if step.SMSMode == smsWithoutAuthID {
+				if _, _, err := f.session.authConfig(true, true); err != nil {
+					return InteractivePrompt{}, err
+				}
+			}
 			f.pendingStep = step
 			f.primarySMS = false
 			f.state = interactiveAwaitingSMS
@@ -453,6 +547,32 @@ func (f *InteractiveFlow) advance(step authStep) (InteractivePrompt, error) {
 			f.primarySMS = false
 			f.state = interactiveAwaitingSMS
 			return InteractivePrompt{State: string(f.state), Message: "Enter the SMS verification code"}, nil
+		case "auth/totp", "auth/radius", "auth/challenge", "auth/token":
+			f.pendingStep = step
+			f.state = interactiveAwaitingToken
+			return InteractivePrompt{
+				State:         string(f.state),
+				Message:       "Enter the authentication token requested by the server",
+				ChallengeKind: step.Service,
+			}, nil
+		case "auth/accessCheck":
+			next, err := f.session.accessCheck()
+			if err != nil {
+				return InteractivePrompt{}, err
+			}
+			step = next
+		case "auth/preEnhancedAuth", "auth/enhancedConfirm", "auth/enhancedDone":
+			next, err := f.session.completeEnhancedAuth(step)
+			if err != nil {
+				return InteractivePrompt{}, err
+			}
+			step = next
+		case "auth/bindAuthDevice":
+			next, err := f.session.bindAuthDevice(step)
+			if err != nil {
+				return InteractivePrompt{}, err
+			}
+			step = next
 		default:
 			return InteractivePrompt{}, fmt.Errorf("unsupported next authentication service: %s", step.Service)
 		}

@@ -31,6 +31,11 @@ const (
 // transport or TLS failure does not prove that the session has expired.
 var ErrSessionInvalid = errors.New("aTrust session is not authenticated")
 
+// ErrCredentialsRejected identifies an explicit password rejection. It is
+// recoverable inside an interactive flow and must not be used for transport,
+// TLS, or server availability failures.
+var ErrCredentialsRejected = errors.New("aTrust credentials rejected")
+
 var sharedParams = url.Values{
 	"clientType": {"SDPClient"},
 	"platform":   {"Linux"},
