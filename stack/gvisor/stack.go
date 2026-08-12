@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"os"
+	"sync"
 
-	"github.com/mythologyli/zju-connect/client"
+	clientpkg "github.com/mythologyli/zju-connect/client"
 	"github.com/mythologyli/zju-connect/client/easyconnect"
 	"github.com/mythologyli/zju-connect/internal/hook_func"
 	"github.com/mythologyli/zju-connect/internal/ippool"
@@ -24,16 +26,19 @@ import (
 type Stack struct {
 	gvisorStack *stack.Stack
 	resolve     zcdns.LocalServer
-	ipPool      *ippool.IPPool[client.DomainResource]
+	ipPool      *ippool.IPPool[[]clientpkg.DomainResource]
 
 	endpoint *Endpoint
+	ipMu     sync.Mutex
+	ip       tcpip.Address
 }
 
 const NICID tcpip.NICID = 1
 const MTU uint32 = 1400
+const maxInboundPacketSize = 1500
 
 type Endpoint struct {
-	client client.Client
+	client clientpkg.Client
 
 	l3Conn io.ReadWriteCloser
 
@@ -89,15 +94,12 @@ func (ep *Endpoint) SetOnCloseAction(func()) {}
 // WritePackets is called when get packets from gVisor stack. Then it sends them to VPN server
 func (ep *Endpoint) WritePackets(list stack.PacketBufferList) (int, tcpip.Error) {
 	for _, packetBuffer := range list.AsSlice() {
-		var buf []byte
-		for _, t := range packetBuffer.AsSlices() {
-			buf = append(buf, t...)
-		}
+		buf := joinPacketSlices(packetBuffer.AsSlices())
 
 		if ep.l3Conn != nil {
 			n, err := ep.l3Conn.Write(buf)
 			if err != nil {
-				if errors.Is(err, client.ErrResourceNotFound) {
+				if errors.Is(err, clientpkg.ErrResourceNotFound) {
 					log.Printf("%v", err)
 					continue
 				}
@@ -130,7 +132,20 @@ func (ep *Endpoint) WritePackets(list stack.PacketBufferList) (int, tcpip.Error)
 	return list.Len(), nil
 }
 
-func NewStack(client client.Client) (*Stack, error) {
+func joinPacketSlices(slices [][]byte) []byte {
+	total := 0
+	for _, slice := range slices {
+		total += len(slice)
+	}
+	buf := make([]byte, total)
+	offset := 0
+	for _, slice := range slices {
+		offset += copy(buf[offset:], slice)
+	}
+	return buf
+}
+
+func NewStack(client clientpkg.Client) (*Stack, error) {
 	s := &Stack{}
 
 	s.gvisorStack = stack.New(stack.Options{
@@ -154,6 +169,7 @@ func NewStack(client client.Client) (*Stack, error) {
 	}
 
 	addr := tcpip.AddrFromSlice(ip)
+	s.ip = addr
 	protoAddr := tcpip.ProtocolAddress{
 		AddressWithPrefix: tcpip.AddressWithPrefix{
 			Address:   addr,
@@ -166,6 +182,7 @@ func NewStack(client client.Client) (*Stack, error) {
 	if tcpipErr != nil {
 		return nil, errors.New(tcpipErr.String())
 	}
+	clientpkg.RegisterIPUpdateHandler(client, s.updateIP)
 
 	sOpt := tcpip.TCPSACKEnabled(true)
 	s.gvisorStack.SetTransportProtocolOption(tcp.ProtocolNumber, &sOpt)
@@ -176,11 +193,37 @@ func NewStack(client client.Client) (*Stack, error) {
 	return s, nil
 }
 
+func (s *Stack) updateIP(ip net.IP) error {
+	ip = ip.To4()
+	if ip == nil {
+		return errors.New("virtual IP update is not IPv4")
+	}
+	newAddr := tcpip.AddrFromSlice(ip)
+	s.ipMu.Lock()
+	defer s.ipMu.Unlock()
+	if newAddr == s.ip {
+		return nil
+	}
+	protoAddr := tcpip.ProtocolAddress{
+		AddressWithPrefix: tcpip.AddressWithPrefix{Address: newAddr, PrefixLen: 32},
+		Protocol:          ipv4.ProtocolNumber,
+	}
+	if err := s.gvisorStack.AddProtocolAddress(NICID, protoAddr, stack.AddressProperties{}); err != nil {
+		return errors.New(err.String())
+	}
+	if err := s.gvisorStack.RemoveAddress(NICID, s.ip); err != nil {
+		_ = s.gvisorStack.RemoveAddress(NICID, newAddr)
+		return errors.New(err.String())
+	}
+	s.ip = newAddr
+	return nil
+}
+
 func (s *Stack) SetupResolve(r zcdns.LocalServer) {
 	s.resolve = r
 }
 
-func (s *Stack) SetupIPPool(ipPool *ippool.IPPool[client.DomainResource]) {
+func (s *Stack) SetupIPPool(ipPool *ippool.IPPool[[]clientpkg.DomainResource]) {
 	s.ipPool = ipPool
 }
 
@@ -191,8 +234,8 @@ func (s *Stack) Run() {
 		panic(connErr)
 	}
 	// Read from VPN server and send to gVisor stack
+	buf := make([]byte, maxInboundPacketSize)
 	for {
-		buf := make([]byte, MTU)
 		n, err := s.endpoint.l3Conn.Read(buf)
 		if err != nil {
 			if hook_func.IsTerminal() {
@@ -204,10 +247,14 @@ func (s *Stack) Run() {
 		log.DebugPrintf("Recv: read %d bytes", n)
 		log.DebugDumpHex(buf[:n])
 
-		packetBuffer := stack.NewPacketBuffer(stack.PacketBufferOptions{
-			Payload: buffer.MakeWithData(buf),
-		})
+		packetBuffer := makeInboundPacketBuffer(buf, n)
 		s.endpoint.dispatcher.DeliverNetworkPacket(header.IPv4ProtocolNumber, packetBuffer)
 		packetBuffer.DecRef()
 	}
+}
+
+func makeInboundPacketBuffer(buf []byte, n int) *stack.PacketBuffer {
+	return stack.NewPacketBuffer(stack.PacketBufferOptions{
+		Payload: buffer.MakeWithData(buf[:n]),
+	})
 }

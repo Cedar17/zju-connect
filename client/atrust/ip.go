@@ -27,7 +27,7 @@ func (c *Client) getIP() error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	conn, err := c.underlayDialer.DialTLSContext(ctx, "tcp", addr, c.nodeTLSConfigForDial())
+	conn, err := c.underlayDialer.DialTLSContext(ctx, "tcp", addr, tunnelTLSConfig())
 	if err != nil {
 		return err
 	}
@@ -83,8 +83,9 @@ func (c *Client) getIP() error {
 				return fmt.Errorf("unexpected response: %x", data)
 			}
 
-			c.ip = net.IPv4(data[2], data[3], data[4], data[5])
-			log.Printf("Received IP: %s", c.ip.String())
+			ip := net.IPv4(data[2], data[3], data[4], data[5])
+			c.setIP(ip)
+			log.Printf("Received IP: %s", ip.String())
 			return nil
 		}
 	}

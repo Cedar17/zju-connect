@@ -36,8 +36,8 @@ type Dialer struct {
 type Options struct {
 	// InterfaceName explicitly selects the interface used by underlay sockets.
 	// It takes precedence over AutoDetect.
-	InterfaceName string
-	AutoDetect    bool
+	InterfaceName   string
+	AutoDetect      bool
 	SocketProtector SocketProtector
 }
 

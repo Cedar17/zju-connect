@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 
+	"github.com/mythologyli/zju-connect/client"
 	"github.com/mythologyli/zju-connect/internal/hook_func"
 	"github.com/mythologyli/zju-connect/log"
 	"github.com/mythologyli/zju-connect/resolve"
@@ -73,9 +74,15 @@ func (ep *TCPListenerEndpoint) SetOnCloseAction(func()) {}
 
 func (ep *TCPListenerEndpoint) WritePackets(list stack.PacketBufferList) (int, tcpip.Error) {
 	for _, packetBuffer := range list.AsSlice() {
-		var buf []byte
-		for _, t := range packetBuffer.AsSlices() {
-			buf = append(buf, t...)
+		slices := packetBuffer.AsSlices()
+		total := 0
+		for _, slice := range slices {
+			total += len(slice)
+		}
+		buf := make([]byte, total)
+		offset := 0
+		for _, slice := range slices {
+			offset += copy(buf[offset:], slice)
 		}
 
 		if ep.tunEndpoint != nil {
@@ -141,12 +148,14 @@ func (s *Stack) handleInboundConn(lConn net.Conn, targetIP string, targetPort ui
 		_ = lConn.Close()
 	}(lConn)
 
-	domain, resource, ok := s.ipPool.GetDomain(net.ParseIP(targetIP))
+	domain, resources, ok := s.ipPool.GetDomain(net.ParseIP(targetIP))
 	ctx := context.Background()
 	if ok {
-		log.DebugPrintf("IP to domain %s", domain)
-		ctx = context.WithValue(ctx, resolve.ContextKeyDomainResource, resource)
-		ctx = context.WithValue(ctx, resolve.ContextKeyResolveHost, domain)
+		if resource, matched := client.MatchDomainResource(resources, "tcp", int(targetPort)); matched {
+			log.DebugPrintf("IP to domain %s", domain)
+			ctx = context.WithValue(ctx, resolve.ContextKeyDomainResource, resource)
+			ctx = context.WithValue(ctx, resolve.ContextKeyResolveHost, domain)
+		}
 	}
 
 	targetAddr := fmt.Sprintf("%s:%d", targetIP, targetPort)

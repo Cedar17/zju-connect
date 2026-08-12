@@ -36,11 +36,7 @@ var conf configs.Config
 func main() {
 	log.Init()
 
-	if CommitID != "" {
-		log.Println("Start ZJU Connect v" + zjuConnectVersion + "-" + CommitID)
-	} else {
-		log.Println("Start ZJU Connect v" + zjuConnectVersion)
-	}
+	log.Println("Start ZJU Connect " + zjuConnectVersionString())
 	if conf.DebugDump {
 		log.EnableDebug()
 	}
@@ -112,6 +108,7 @@ func main() {
 		}
 
 		vpnClient = atrustclient.NewClient(conf.Username, conf.SID, conf.DeviceID, conf.SignKey)
+		vpnClient.(*atrustclient.Client).SetSkipTCPTunnelWait(conf.SkipTCPTunnelWait)
 
 		log.Printf("VPN protocol: %s", conf.Protocol)
 		clientData, err = vpnClient.(*atrustclient.Client).Setup(
@@ -125,6 +122,7 @@ func main() {
 			conf.GraphCodeFile,
 			conf.CasTicket,
 			conf.OAuth2Code,
+			conf.TOTPSecret,
 			clientData,
 			resourceData,
 			conf.UpdateBestNodesInterval,
@@ -177,14 +175,14 @@ func main() {
 	if conf.Protocol == "easyconnect" {
 		if !conf.DisableZJUConfig {
 			if domainResources == nil {
-				domainResources = make(map[string]client.DomainResource)
+				domainResources = make(client.DomainResources)
 			}
 
-			domainResources["zju.edu.cn"] = client.DomainResource{
+			domainResources["zju.edu.cn"] = []client.DomainResource{{
 				PortMin:  1,
 				PortMax:  65535,
 				Protocol: "all",
-			}
+			}}
 
 			if ipResources == nil {
 				ipResources = []client.IPResource{}
@@ -208,18 +206,18 @@ func main() {
 
 		for _, customProxyDomain := range conf.CustomProxyDomain {
 			if domainResources != nil {
-				domainResources[customProxyDomain] = client.DomainResource{
+				domainResources[customProxyDomain] = append(domainResources[customProxyDomain], client.DomainResource{
 					PortMin:  1,
 					PortMax:  65535,
 					Protocol: "all",
-				}
+				})
 			} else {
-				domainResources = map[string]client.DomainResource{
-					customProxyDomain: {
+				domainResources = client.DomainResources{
+					customProxyDomain: {{
 						PortMin:  1,
 						PortMax:  65535,
 						Protocol: "all",
-					},
+					}},
 				}
 			}
 		}
@@ -261,6 +259,7 @@ func main() {
 
 	useRemoteDNS := !conf.DisableRemoteDNS
 	remoteDNSServer := conf.RemoteDNSServer
+	policyDNSServers, _ := vpnClient.DNSServers()
 	if useRemoteDNS && remoteDNSServer == "auto" {
 		remoteDNSServer, err = vpnClient.DNSServer()
 		if err != nil {
@@ -271,11 +270,19 @@ func main() {
 			log.Printf("Use DNS server %s provided by server", remoteDNSServer)
 		}
 	}
+	secondaryDNSServer := conf.SecondaryDNSServer
+	if secondaryDNSServer == "auto" {
+		secondaryDNSServer = "114.114.114.114"
+		if len(policyDNSServers) > 1 {
+			secondaryDNSServer = policyDNSServers[1]
+			log.Printf("Use secondary DNS server %s provided by server", secondaryDNSServer)
+		}
+	}
 
 	vpnResolver := resolve.NewResolver(
 		vpnStack,
 		remoteDNSServer,
-		conf.SecondaryDNSServer,
+		secondaryDNSServer,
 		conf.DNSTTL,
 		domainResources,
 		dnsResource,

@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/mythologyli/zju-connect/client"
+	"github.com/mythologyli/zju-connect/internal/ipresource"
 	"github.com/mythologyli/zju-connect/log"
 	"inet.af/netaddr"
 )
@@ -74,8 +75,8 @@ func (c *Client) parseResource(resource []byte) error {
 
 	ipSetBuilder := netaddr.IPSetBuilder{}
 	c.ipResources = make([]client.IPResource, 0)
-	c.domainResources = make(map[string]client.DomainResource)
-	c.dnsResource = make(map[string]net.IP)
+	c.domainResources = make(client.DomainResources)
+	c.dnsResource = make(map[string][]net.IP)
 
 	for _, app := range clientResource.Data.AppList.Data.AppInfo {
 		for _, appItem := range app.Apps {
@@ -191,13 +192,18 @@ func (c *Client) parseResource(resource []byte) error {
 					}
 
 					if isDomain {
-						c.domainResources[strings.ReplaceAll(hostStr, "*", "")] = client.DomainResource{
+						domain := normalizePolicyDomain(hostStr)
+						if domain == "" {
+							log.DebugPrintf("Ignore unsupported domain pattern: %s", hostStr)
+							continue
+						}
+						c.domainResources[domain] = append(c.domainResources[domain], client.DomainResource{
 							PortMin:     portMin,
 							PortMax:     portMax,
 							Protocol:    address.Protocol,
 							AppID:       appItem.ID,
 							NodeGroupID: appItem.NodeGroupID,
-						}
+						})
 
 						log.DebugPrintf("Add domain: %s, Port range: %d ~ %d, [%s]", hostStr, portMin, portMax, address.Protocol)
 					}
@@ -214,10 +220,8 @@ func (c *Client) parseResource(resource []byte) error {
 							if ip != nil {
 								if ip.To4() != nil {
 									ipSetBuilder.Add(netaddr.MustParseIP(ip.String()))
-									c.dnsResource[hostStr] = ip
+									c.dnsResource[hostStr] = append(c.dnsResource[hostStr], ip)
 									log.DebugPrintf("Add DNS rule: %s -> %s", hostStr, ipStr)
-
-									break // TODO: handle multiple IPs for the same domain
 								} else {
 									log.DebugPrintf("IPv6 address found: %s, skipping", ip)
 								}
@@ -231,20 +235,28 @@ func (c *Client) parseResource(resource []byte) error {
 		}
 	}
 
-	if clientResource.Data.SDPPolicy.Data.ClientOption.DNSOption.FirstDNS != "" {
-		c.dnsServer = clientResource.Data.SDPPolicy.Data.ClientOption.DNSOption.FirstDNS
-		log.DebugPrintf("Set DNS server: %s", c.dnsServer)
-	} else if clientResource.Data.SDPPolicy.Data.ClientOption.DNSOptionV2.FirstDNS != "" {
-		c.dnsServer = clientResource.Data.SDPPolicy.Data.ClientOption.DNSOptionV2.FirstDNS
-		log.DebugPrintf("Set DNS server: %s", c.dnsServer)
+	dnsOption := clientResource.Data.SDPPolicy.Data.ClientOption.DNSOption
+	if dnsOption.FirstDNS == "" {
+		dnsOption = clientResource.Data.SDPPolicy.Data.ClientOption.DNSOptionV2
+	}
+	c.dnsServers = c.dnsServers[:0]
+	for _, server := range []string{dnsOption.FirstDNS, dnsOption.SecondDNS} {
+		if server != "" {
+			c.dnsServers = append(c.dnsServers, server)
+		}
+	}
+	if len(c.dnsServers) > 0 {
+		c.dnsServer = c.dnsServers[0]
+		log.DebugPrintf("Set DNS servers: %v", c.dnsServers)
 	} else {
+		c.dnsServer = ""
 		log.DebugPrintf("No DNS server found")
 	}
 
 	c.MajorNodeGroup = clientResource.Data.AppList.Data.Config.NodeGroupConf.MajorNodeGroup.ID
-	c.NodeGroups = make(map[string][]string)
+	c.NodeGroups = make(map[string]NodeGroup)
 	for _, nodeGroup := range clientResource.Data.AppList.Data.Config.NodeGroupConf.NodeGroupList {
-		addressList := make([]string, 0)
+		addresses := NodeGroup{}
 		for _, addressInfo := range nodeGroup.AddressInfo {
 			address := addressInfo.Address
 			if address == "{{sdpcHost}}" {
@@ -253,7 +265,14 @@ func (c *Client) parseResource(resource []byte) error {
 			if !strings.Contains(address, ":") {
 				address += ":441"
 			}
-			addressList = append(addressList, address)
+			switch strings.ToLower(addressInfo.Type) {
+			case "wan":
+				addresses.WAN = append(addresses.WAN, address)
+			case "lan":
+				addresses.LAN = append(addresses.LAN, address)
+			default:
+				log.DebugPrintf("Ignore node with unsupported type %q: %s", addressInfo.Type, address)
+			}
 
 			// Remove ip from ipSetBuilder to prevent circular routing
 			host, _, err := net.SplitHostPort(address)
@@ -266,11 +285,28 @@ func (c *Client) parseResource(resource []byte) error {
 				log.DebugPrintf("Remove IP from IP set to prevent circular routing: %s", ip)
 			}
 		}
-		c.NodeGroups[nodeGroup.ID] = addressList
-		log.DebugPrintf("Node Group ID: %s, Addresses: %v", nodeGroup.ID, addressList)
+		c.NodeGroups[nodeGroup.ID] = addresses
+		log.DebugPrintf(
+			"Node Group ID: %s, WAN Addresses: %v, LAN Addresses: %v",
+			nodeGroup.ID,
+			addresses.WAN,
+			addresses.LAN,
+		)
 	}
 
 	c.ipSet, _ = ipSetBuilder.IPSet()
+	c.resourceIndex = ipresource.New(c.ipResources)
 
 	return nil
+}
+
+func normalizePolicyDomain(domain string) string {
+	domain = strings.TrimSpace(domain)
+	if strings.HasPrefix(domain, "*.") {
+		return domain[1:]
+	}
+	if strings.Contains(domain, "*") {
+		return ""
+	}
+	return domain
 }

@@ -13,10 +13,46 @@ import (
 
 const pingNum = 3
 
-func getBestNodes(nodeGroups map[string][]string, dialContext func(context.Context, string, string) (net.Conn, error)) map[string]string {
+type NodeGroup struct {
+	WAN []string
+	LAN []string
+}
+
+type nodeGroupsProbeFunc func(map[string][]string) map[string]string
+
+func getBestNodes(nodeGroups map[string]NodeGroup, dialContext func(context.Context, string, string) (net.Conn, error)) map[string]string {
+	return selectBestNodes(nodeGroups, func(nodeGroups map[string][]string) map[string]string {
+		return getBestReachableNodes(nodeGroups, dialContext)
+	})
+}
+
+func selectBestNodes(nodeGroups map[string]NodeGroup, probe nodeGroupsProbeFunc) map[string]string {
+	wanNodeGroups := make(map[string][]string, len(nodeGroups))
+	for group, nodes := range nodeGroups {
+		wanNodeGroups[group] = nodes.WAN
+	}
+	bestNodes := probe(wanNodeGroups)
+
+	fallbackNodeGroups := make(map[string][]string)
+	for group, nodes := range nodeGroups {
+		if bestNodes[group] == "" && len(nodes.LAN) > 0 {
+			fallbackNodeGroups[group] = nodes.LAN
+		}
+	}
+
+	if len(fallbackNodeGroups) == 0 {
+		return bestNodes
+	}
+	for group, node := range probe(fallbackNodeGroups) {
+		bestNodes[group] = node
+	}
+	return bestNodes
+}
+
+func getBestReachableNodes(nodeGroups map[string][]string, dialContext func(context.Context, string, string) (net.Conn, error)) map[string]string {
 	bestNodes := make(map[string]string)
 	for group, nodes := range nodeGroups {
-		if len(nodes) > 1 {
+		if len(nodes) > 0 {
 			var pingList []ping.TCPing
 			var chList []<-chan struct{}
 
@@ -49,33 +85,36 @@ func getBestNodes(nodeGroups map[string][]string, dialContext func(context.Conte
 				<-ch
 			}
 
-			bestLatency := int64(0)
+			bestScore := time.Duration(0)
 			bestNode := ""
 			for i, tcping := range pingList {
 				result := tcping.Result()
-				if result.SuccessCounter == pingNum {
-					latency := result.Avg().Milliseconds()
-
-					if bestLatency == 0 || latency < bestLatency {
-						bestNode = nodes[i]
-						bestLatency = latency
-					}
+				score, reachable := nodeProbeScore(result)
+				if reachable && (bestScore == 0 || score < bestScore) {
+					bestNode = nodes[i]
+					bestScore = score
 				}
 			}
 
 			if bestNode != "" {
 				bestNodes[group] = bestNode
-				log.Printf("Best node in group %s: %s with latency %d ms", group, bestNode, bestLatency)
-			} else {
-				log.Printf("No reachable node in group %s, using the first node", group)
-				bestNodes[group] = nodes[0]
+				log.Printf("Best node in group %s: %s with quality score %d ms", group, bestNode, bestScore.Milliseconds())
 			}
-		} else if len(nodes) == 1 {
-			bestNodes[group] = nodes[0]
 		}
 	}
 
 	return bestNodes
+}
+
+func nodeProbeScore(result *ping.Result) (time.Duration, bool) {
+	if result == nil || result.SuccessCounter == 0 {
+		return 0, false
+	}
+	penalty := time.Second
+	if result.Target != nil && result.Target.Timeout > 0 {
+		penalty = result.Target.Timeout
+	}
+	return result.Avg() + time.Duration(result.Failed())*penalty, true
 }
 
 func (c *Client) updateBestNodes(ctx context.Context, updateBestNodesInterval int) {
@@ -93,5 +132,12 @@ func (c *Client) updateBestNodes(ctx context.Context, updateBestNodesInterval in
 		c.BestNodesRWMutex.Lock()
 		c.BestNodes = bestNodes
 		c.BestNodesRWMutex.Unlock()
+
+		c.l3TunnelMu.Lock()
+		tunnel := c.l3Tunnel
+		c.l3TunnelMu.Unlock()
+		if tunnel != nil {
+			tunnel.evictStaleConns(bestNodes, c.MajorNodeGroup)
+		}
 	}
 }

@@ -2,7 +2,6 @@ package atrust
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -14,9 +13,11 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mythologyli/zju-connect/client"
+	"github.com/mythologyli/zju-connect/internal/ipresource"
 	"github.com/mythologyli/zju-connect/log"
 	"github.com/mythologyli/zju-connect/resolve"
 )
@@ -27,6 +28,127 @@ type tcpTunnelConn struct {
 	readBuf []byte
 }
 
+type tcpTunnelFrame struct {
+	payload []byte
+}
+
+const maxPooledTCPTunnelFrameSize = 4096
+
+var tcpTunnelFramePool = sync.Pool{
+	New: func() any {
+		return &tcpTunnelFrame{payload: make([]byte, 0, 2048)}
+	},
+}
+
+func readTCPProtocolResponse(reader *bufio.Reader) (string, error) {
+	lengthBytes := make([]byte, 2)
+	if _, err := io.ReadFull(reader, lengthBytes); err != nil {
+		return "", err
+	}
+	data := make([]byte, binary.BigEndian.Uint16(lengthBytes))
+	if _, err := io.ReadFull(reader, data); err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func waitForTCPConnect(ctx context.Context, conn net.Conn, reader *bufio.Reader) (err error) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	cancelDone := make(chan struct{})
+	stopCancel := context.AfterFunc(ctx, func() {
+		defer close(cancelDone)
+		_ = conn.Close()
+	})
+	defer func() {
+		if !stopCancel() {
+			<-cancelDone
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			err = ctxErr
+		}
+	}()
+
+	for {
+		header := make([]byte, 2)
+		if _, err := io.ReadFull(reader, header); err != nil {
+			return fmt.Errorf("failed to read tcp tunnel response: %w", err)
+		}
+		if log.DebugEnabled() {
+			log.DebugPrintf("Received header: %02X %02X", header[0], header[1])
+		}
+		if header[0] == 0x05 && header[1] == 0x81 {
+			continue
+		}
+		if header[0] != 0x53 || header[1] != 0x00 {
+			return fmt.Errorf("unexpected tcp tunnel response: %02X %02X", header[0], header[1])
+		}
+
+		response, err := readTCPProtocolResponse(reader)
+		if err != nil {
+			return fmt.Errorf("failed to read tcp tunnel protocol response: %w", err)
+		}
+		log.DebugPrint("Received protocol response:")
+		log.DebugDumpHex([]byte(response))
+		if !strings.Contains(response, "OK") {
+			return fmt.Errorf("tcp tunnel setup failed: %s", response)
+		}
+		break
+	}
+
+	probe := []byte{0x01, 0x00, 0x00, 0x00}
+	if n, err := conn.Write(probe); err != nil {
+		return fmt.Errorf("failed to send tcp tunnel connect probe: %w", err)
+	} else if n != len(probe) {
+		return fmt.Errorf("failed to send tcp tunnel connect probe: %w", io.ErrShortWrite)
+	}
+	log.DebugPrint("Sent TCP connect probe")
+	log.DebugDumpHex(probe)
+
+	status := make([]byte, 2)
+	if _, err := io.ReadFull(reader, status); err != nil {
+		return fmt.Errorf("failed to read tcp tunnel connect status: %w", err)
+	}
+	if log.DebugEnabled() {
+		log.DebugPrintf("Received TCP connect status: %02X %02X", status[0], status[1])
+	}
+	if status[0] != 0x05 {
+		return fmt.Errorf("unexpected tcp tunnel connect status: %02X %02X", status[0], status[1])
+	}
+
+	switch status[1] {
+	case 0x00:
+		return nil
+	case 0x01:
+		return fmt.Errorf("tcp tunnel server failure")
+	case 0x02:
+		return fmt.Errorf("tcp tunnel connection not allowed")
+	case 0x03:
+		return fmt.Errorf("network is unreachable")
+	case 0x04:
+		return fmt.Errorf("host is unreachable")
+	case 0x05:
+		return fmt.Errorf("connection refused")
+	case 0x06:
+		return fmt.Errorf("tcp tunnel TTL expired")
+	case 0x07:
+		return fmt.Errorf("tcp tunnel command not supported")
+	case 0x08:
+		return fmt.Errorf("tcp tunnel address type not supported")
+	default:
+		return fmt.Errorf("tcp tunnel connect failed with status 0x%02X", status[1])
+	}
+}
+
+func (c *Client) waitForTCPConnect(ctx context.Context, conn net.Conn, reader *bufio.Reader) error {
+	if c.skipTCPTunnelWait {
+		return nil
+	}
+	return waitForTCPConnect(ctx, conn, reader)
+}
+
 func (c *tcpTunnelConn) Read(b []byte) (int, error) {
 	if len(c.readBuf) > 0 {
 		n := copy(b, c.readBuf)
@@ -35,19 +157,29 @@ func (c *tcpTunnelConn) Read(b []byte) (int, error) {
 	}
 
 	for {
-		header := make([]byte, 2)
-		_, err := io.ReadFull(c.reader, header)
+		var header [2]byte
+		_, err := io.ReadFull(c.reader, header[:])
 		if err != nil {
 			return 0, err
 		}
-		log.DebugPrint("Received header: ", fmt.Sprintf("%02X %02X", header[0], header[1]))
+		if log.DebugEnabled() {
+			log.DebugPrintf("Received header: %02X %02X", header[0], header[1])
+		}
 		if header[0] == 0x01 && header[1] == 0x00 {
-			lengthBytes := make([]byte, 2)
-			_, err = io.ReadFull(c.reader, lengthBytes)
+			var lengthBytes [2]byte
+			_, err = io.ReadFull(c.reader, lengthBytes[:])
 			if err != nil {
 				return 0, err
 			}
-			length := binary.BigEndian.Uint16(lengthBytes)
+			length := int(binary.BigEndian.Uint16(lengthBytes[:]))
+			if length <= len(b) {
+				if _, err = io.ReadFull(c.reader, b[:length]); err != nil {
+					return 0, err
+				}
+				log.DebugPrint("Received application data, length:", length)
+				log.DebugDumpHex(b[:length])
+				return length, nil
+			}
 			data := make([]byte, length)
 			_, err = io.ReadFull(c.reader, data)
 			if err != nil {
@@ -63,8 +195,7 @@ func (c *tcpTunnelConn) Read(b []byte) (int, error) {
 
 			return n, nil
 		} else if header[0] == 0x01 && header[1] == 0x01 {
-			header = make([]byte, 2)
-			_, err = io.ReadFull(c.reader, header)
+			_, err = io.ReadFull(c.reader, header[:])
 			if err != nil {
 				return 0, err
 			}
@@ -75,12 +206,12 @@ func (c *tcpTunnelConn) Read(b []byte) (int, error) {
 				return 0, fmt.Errorf("connection closed by server")
 			}
 		} else if header[0] == 0x53 && header[1] == 0x00 {
-			lengthBytes := make([]byte, 2)
-			_, err = io.ReadFull(c.reader, lengthBytes)
+			var lengthBytes [2]byte
+			_, err = io.ReadFull(c.reader, lengthBytes[:])
 			if err != nil {
 				return 0, err
 			}
-			length := binary.BigEndian.Uint16(lengthBytes)
+			length := binary.BigEndian.Uint16(lengthBytes[:])
 
 			data := make([]byte, length)
 			_, err = io.ReadFull(c.reader, data)
@@ -106,21 +237,47 @@ func (c *tcpTunnelConn) Read(b []byte) (int, error) {
 }
 
 func (c *tcpTunnelConn) Write(b []byte) (int, error) {
-	header := []byte{0x01, 0x00}
 	length := len(b)
 	if length > 0xFFFF {
 		return 0, fmt.Errorf("data too large")
 	}
-	lengthBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(lengthBytes, uint16(length))
-	frame := bytes.Buffer{}
-	frame.Write(header)
-	frame.Write(lengthBytes)
-	frame.Write(b)
-	_, err := c.tlsConn.Write(frame.Bytes())
-	log.DebugDumpHex(frame.Bytes())
+	frame := getTCPTunnelFrame(b)
+	defer putTCPTunnelFrame(frame)
+	err := writeTCPTunnelFrame(c.tlsConn, frame.payload)
+	log.DebugDumpHex(frame.payload)
 
 	return length, err
+}
+
+func writeTCPTunnelFrame(writer io.Writer, frame []byte) error {
+	n, err := writer.Write(frame)
+	if err == nil && n != len(frame) {
+		return io.ErrShortWrite
+	}
+	return err
+}
+
+func getTCPTunnelFrame(data []byte) *tcpTunnelFrame {
+	frame := tcpTunnelFramePool.Get().(*tcpTunnelFrame)
+	required := 4 + len(data)
+	if cap(frame.payload) < required {
+		frame.payload = make([]byte, required)
+	} else {
+		frame.payload = frame.payload[:required]
+	}
+	frame.payload[0] = 0x01
+	frame.payload[1] = 0x00
+	binary.BigEndian.PutUint16(frame.payload[2:4], uint16(len(data)))
+	copy(frame.payload[4:], data)
+	return frame
+}
+
+func putTCPTunnelFrame(frame *tcpTunnelFrame) {
+	if cap(frame.payload) > maxPooledTCPTunnelFrameSize {
+		return
+	}
+	frame.payload = frame.payload[:0]
+	tcpTunnelFramePool.Put(frame)
 }
 
 func (c *tcpTunnelConn) Close() error {
@@ -166,28 +323,31 @@ func calcXRequestSig(key []byte, data []byte) string {
 	return strings.ToUpper(hex.EncodeToString(sum))
 }
 
+func matchTCPIPResource(index *ipresource.Index, addr *net.TCPAddr) (client.IPResource, bool) {
+	return index.MatchLast(addr.IP, "tcp", addr.Port)
+}
+
 func (c *Client) DialTCP(ctx context.Context, addr *net.TCPAddr) (net.Conn, error) {
 	appID := ""
 	nodeGroupID := ""
 	domain := ""
-	if res := ctx.Value(resolve.ContextKeyDomainResource); res != nil {
-		resource := res.(client.DomainResource)
+	if resource, ok := ctx.Value(resolve.ContextKeyDomainResource).(client.DomainResource); ok {
 		appID = resource.AppID
 		nodeGroupID = resource.NodeGroupID
-		if res = ctx.Value(resolve.ContextKeyResolveHost); res != nil {
+		if res := ctx.Value(resolve.ContextKeyResolveHost); res != nil {
 			domain = res.(string)
 		}
-	} else {
-		for _, resource := range c.ipResources {
-			if bytes.Compare(addr.IP, resource.IPMin) >= 0 && bytes.Compare(addr.IP, resource.IPMax) <= 0 {
-				if resource.PortMin <= addr.Port && addr.Port <= resource.PortMax {
-					if resource.Protocol == "tcp" || resource.Protocol == "all" {
-						appID = resource.AppID
-						nodeGroupID = resource.NodeGroupID
-					}
-				}
-			}
+	}
+	if appID == "" {
+		resource, ok := matchTCPIPResource(c.resourceIndex, addr)
+		if ok {
+			appID = resource.AppID
+			nodeGroupID = resource.NodeGroupID
+			domain = ""
 		}
+	}
+	if appID == "" {
+		return nil, fmt.Errorf("host:%s port:%d is not resource: %w", addr.IP, addr.Port, client.ErrResourceNotFound)
 	}
 
 	c.BestNodesRWMutex.RLock()
@@ -271,8 +431,13 @@ func (c *Client) DialTCP(ctx context.Context, addr *net.TCPAddr) (net.Conn, erro
 	}
 	log.DebugDumpHex(destMsg)
 
-	return &tcpTunnelConn{
+	tunnelConn := &tcpTunnelConn{
 		tlsConn: conn,
 		reader:  bufio.NewReader(conn),
-	}, nil
+	}
+	if err := c.waitForTCPConnect(ctx, conn, tunnelConn.reader); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return tunnelConn, nil
 }

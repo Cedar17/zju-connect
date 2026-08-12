@@ -78,13 +78,17 @@ jobs:
         run: go mod download
 
       - name: Build
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           mkdir -p build_assets
           SHORT_SHA=$(git rev-parse --short HEAD)
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            VERSION_FLAGS=""
+          VERSION=dev
+          VERSION_FLAGS="-X main.zjuConnectVersion=${VERSION}"
+          if [ "${{ github.event_name }}" = "release" ]; then
+            VERSION_FLAGS="-X main.zjuConnectVersion=${RELEASE_TAG}"
           else
-            VERSION_FLAGS="-X 'main.CommitID=${SHORT_SHA}'"
+            VERSION_FLAGS="${VERSION_FLAGS} -X main.CommitID=${SHORT_SHA}"
           fi
           go build -v -o build_assets/zju-connect -trimpath \
             -ldflags "-s -w -buildid= ${VERSION_FLAGS}" .
@@ -160,8 +164,10 @@ jobs:
           sed -i "s/^pkgver=.*/pkgver=${PKGVER}/" PKGBUILD
           sed -i "s/^pkgrel=.*/pkgrel=${PKGREL}/" PKGBUILD
 
-          docker run --rm -v "$PWD:/pkg" -w /pkg archlinux:base-devel bash <<'EOF'
+          docker run --rm -i -v "$PWD:/pkg" -w /pkg archlinux:base-devel bash <<'EOF'
           set -euo pipefail
+          pkg_owner="$(stat -c '%u:%g' /pkg)"
+          trap 'chown -R "$pkg_owner" /pkg' EXIT
           pacman -Sy --noconfirm pacman-contrib
           useradd -m builder
           chown -R builder:builder /pkg

@@ -129,6 +129,8 @@
 
 + `tcp-tunnel-mode`: TCP tunnel mode, default is `false`. When enabled, only TCP traffic can be proxied through the TCP tunnel. Since only aTrust supports TCP tunneling, this mode is ineffective under EasyConnect. Enabling this will disable TUN mode
 
++ `skip-tcp-tunnel-wait`: Do not wait for the aTrust TCP tunnel connection status, default is `false`. This is intended only for compatibility with servers that do not return connection status; connection failures may then be detected only during subsequent I/O
+
 + `tun-mode`: TUN mode (experimental). Please read the TUN mode precautions below
 
 + `add-route`: Add routes according to the configuration issued by the server when TUN mode is enabled
@@ -141,7 +143,7 @@
 
 + `zju-dns-server`: Remote DNS server address, default is `auto`. Set to `auto` to use the DNS server obtained from the server; disable remote DNS if it fails to obtain
 
-+ `secondary-dns-server`: Standby DNS server used when the remote DNS server cannot resolve, default is `114.114.114.114`. Leave blank to use system default DNS, but must be set when `dns-hijack` is enabled
++ `secondary-dns-server`: Standby DNS server used when the remote DNS server cannot resolve. The default `auto` uses the second server supplied by VPN policy, then falls back to `114.114.114.114`. Leave blank to use system default DNS, but it must be set when `dns-hijack` is enabled
 
 + `dns-server-bind`: DNS server listening address, default is empty (disabled). For example, set to `127.0.0.1:53`, then you can send DNS requests to `127.0.0.1:53`
 

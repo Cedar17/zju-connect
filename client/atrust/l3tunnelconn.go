@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mythologyli/zju-connect/internal/zctcpip"
 	"github.com/mythologyli/zju-connect/log"
 )
 
@@ -31,11 +32,29 @@ const (
 	cmdDataResp      = 0x94
 	cmdHeartbeatReq  = 0x15
 	cmdHeartbeatResp = 0x95
-	cmdSecondVipReq  = 0x16
 	cmdSecondVipResp = 0x96
+
+	defaultHeartbeatInterval  = 10 * time.Second
+	defaultHeartbeatMissLimit = 3
+	defaultAuthTimeout        = 8 * time.Second
+	defaultAuthScanInterval   = 250 * time.Millisecond
+	defaultAuthRetryWait      = 10 * time.Second
+	defaultAuthMaxAttempts    = 3
+	defaultAuthBatchSize      = 64
+	authServerBusyCode        = 0x86
 )
 
 var errL3TunnelAuthTimeout = errors.New("l3-tunnel auth timeout")
+
+type dataFrame struct {
+	payload []byte
+}
+
+var dataFramePool = sync.Pool{
+	New: func() any {
+		return &dataFrame{payload: make([]byte, 0, 2048)}
+	},
+}
 
 type clientInfo struct {
 	sid          string
@@ -45,18 +64,23 @@ type clientInfo struct {
 }
 
 type l3TunnelConn struct {
-	tlsConn      *tls.Conn
-	reader       *bufio.Reader
-	writeMu      sync.Mutex
-	incoming     chan []byte
-	closeOnce    sync.Once
-	closeCh      chan struct{}
-	conntrackMgr *conntrackMgr
-	signKey      []byte
-	info         clientInfo
-	onVIP        func([]net.IP)
-	vipRequested uint32
-	dataMode     string
+	addr               string
+	tlsConn            *tls.Conn
+	reader             *bufio.Reader
+	writeMu            sync.Mutex
+	incoming           chan []byte
+	closeOnce          sync.Once
+	closeCh            chan struct{}
+	conntrackMgr       *conntrackMgr
+	signKey            []byte
+	info               clientInfo
+	onVIP              func([]net.IP)
+	heartbeatInterval  time.Duration
+	heartbeatMissLimit int32
+	heartbeatMisses    int32
+	authWake           chan struct{}
+	writeFrameHook     func([]byte) error
+	dataStream         []byte
 }
 
 type authIP struct {
@@ -140,14 +164,13 @@ type packetMeta struct {
 }
 
 type frame struct {
-	cmd      byte
-	status   byte
-	payload  []byte
-	dataMode string
+	cmd     byte
+	status  byte
+	payload []byte
 }
 
-func newL3TunnelConn(ctx context.Context, dialTLS func(context.Context, string, string, *tls.Config) (*tls.Conn, error), addr string, tlsConfig *tls.Config, info clientInfo, signKeyHex string, onVIP func([]net.IP)) (*l3TunnelConn, error) {
-	tlsConn, err := dialTLS(ctx, "tcp", addr, tlsConfig)
+func newL3TunnelConn(ctx context.Context, dialTLS func(context.Context, string, string, *tls.Config) (*tls.Conn, error), addr string, info clientInfo, signKeyHex string, onVIP func([]net.IP)) (*l3TunnelConn, error) {
+	tlsConn, err := dialTLS(ctx, "tcp", addr, tunnelTLSConfig())
 	if err != nil {
 		return nil, err
 	}
@@ -159,37 +182,57 @@ func newL3TunnelConn(ctx context.Context, dialTLS func(context.Context, string, 
 	}
 
 	c := &l3TunnelConn{
-		tlsConn:      tlsConn,
-		reader:       bufio.NewReader(tlsConn),
-		incoming:     make(chan []byte, 128),
-		closeCh:      make(chan struct{}),
-		conntrackMgr: newConntrackMgr(),
-		signKey:      signKey,
-		info:         info,
-		onVIP:        onVIP,
+		addr:               addr,
+		tlsConn:            tlsConn,
+		reader:             bufio.NewReader(tlsConn),
+		incoming:           make(chan []byte, 128),
+		closeCh:            make(chan struct{}),
+		conntrackMgr:       newConntrackMgr(),
+		signKey:            signKey,
+		info:               info,
+		onVIP:              onVIP,
+		heartbeatInterval:  defaultHeartbeatInterval,
+		heartbeatMissLimit: defaultHeartbeatMissLimit,
+		authWake:           make(chan struct{}, 1),
 	}
-
-	if err := c.authTunnel(); err != nil {
+	if err := c.withContextDeadline(ctx, c.authTunnel); err != nil {
 		_ = c.Close()
 		return nil, err
 	}
 
+	go c.authLoop()
 	go c.readLoop()
 	go c.heartbeatLoop()
 	return c, nil
+}
+
+func (c *l3TunnelConn) withContextDeadline(ctx context.Context, operation func() error) error {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return operation()
+	}
+	if err := c.tlsConn.SetDeadline(deadline); err != nil {
+		return err
+	}
+	operationErr := operation()
+	clearErr := c.tlsConn.SetDeadline(time.Time{})
+	if operationErr != nil {
+		return operationErr
+	}
+	return clearErr
 }
 
 func (c *l3TunnelConn) Close() error {
 	var err error
 	c.closeOnce.Do(func() {
 		close(c.closeCh)
+		c.conntrackMgr.close()
 		err = c.tlsConn.Close()
 	})
 	return err
 }
 
 func (c *l3TunnelConn) readLoop() {
-	var lengthDataRemainder []byte
 	for {
 		fr, err := c.readFrame()
 		if err != nil {
@@ -200,44 +243,20 @@ func (c *l3TunnelConn) readLoop() {
 
 		switch fr.cmd {
 		case cmdDataResp:
-			if fr.dataMode == "len" {
-				lengthDataRemainder = append(lengthDataRemainder, fr.payload...)
-				packets, remainder, err := parseLengthDataStream(lengthDataRemainder)
-				if err != nil {
-					log.DebugPrintf("l3-tunnel parse length data stream failed: %v", err)
-					_ = c.Close()
-					return
-				}
-				lengthDataRemainder = remainder
-				log.DebugPrintf(
-					"l3-tunnel recv length data packets=%d payloadLen=%d remainderLen=%d",
-					len(packets),
-					len(fr.payload),
-					len(lengthDataRemainder),
-				)
-				for _, pkt := range packets {
-					select {
-					case c.incoming <- pkt:
-					case <-c.closeCh:
-						return
-					}
-				}
-				continue
-			}
-			packets, err := parseDataPayload(fr.payload)
+			c.dataStream = append(c.dataStream, fr.payload...)
+			packets, remaining, err := splitIncomingIPPackets(c.dataStream)
 			if err != nil {
-				log.DebugPrintf("l3-tunnel parse data payload failed: %v", err)
-				continue
+				log.DebugPrintf("l3-tunnel parse data stream failed: %v", err)
+				_ = c.Close()
+				return
 			}
-			tokenLen := 0
-			if len(fr.payload) > 0 {
-				tokenLen = int(fr.payload[0])
+			c.dataStream = remaining
+			if log.DebugEnabled() {
+				log.DebugPrintf("l3-tunnel recv data packets=%d payloadLen=%d buffered=%d", len(packets), len(fr.payload), len(remaining))
 			}
-			log.DebugPrintf("l3-tunnel recv data tokenLen=%d packets=%d payloadLen=%d", tokenLen, len(packets), len(fr.payload))
 			for _, pkt := range packets {
-				select {
-				case c.incoming <- pkt:
-				case <-c.closeCh:
+				c.refreshIncomingConntrack(pkt)
+				if !c.deliverIncoming(pkt) {
 					return
 				}
 			}
@@ -245,27 +264,86 @@ func (c *l3TunnelConn) readLoop() {
 			log.DebugPrintf("l3-tunnel recv auth resp status=%d payloadLen=%d", fr.status, len(fr.payload))
 			c.handleAuthResp(fr.status, fr.payload)
 		case cmdSecondVipResp:
-			log.DebugPrintf("l3-tunnel recv second vip status=%d payloadLen=%d", fr.status, len(fr.payload))
+			log.DebugPrintf("l3-tunnel recv vip update cmd=0x%02x status=%d payloadLen=%d", fr.cmd, fr.status, len(fr.payload))
 			c.handleSecondVipResp(fr.status, fr.payload)
 		case cmdHeartbeatResp:
 			log.DebugPrintf("l3-tunnel recv heartbeat")
+			atomic.StoreInt32(&c.heartbeatMisses, 0)
 		default:
 			log.DebugPrintf("l3-tunnel ignore cmd 0x%02x", fr.cmd)
 		}
 	}
 }
 
+func (c *l3TunnelConn) refreshIncomingConntrack(packet []byte) {
+	ipPacket := zctcpip.IPv4Packet(packet)
+	if !ipPacket.Valid() {
+		return
+	}
+	meta, err := buildPacketMeta(ipPacket)
+	if err != nil {
+		return
+	}
+	meta.srcIP, meta.dstIP = meta.dstIP, meta.srcIP
+	meta.srcPort, meta.dstPort = meta.dstPort, meta.srcPort
+	c.conntrackMgr.observePacket(connTrackKey(meta), packet, true)
+}
+
+func (c *l3TunnelConn) deliverIncoming(packet []byte) bool {
+	select {
+	case <-c.closeCh:
+		return false
+	default:
+	}
+	select {
+	case c.incoming <- packet:
+		return true
+	case <-c.closeCh:
+		return false
+	default:
+		log.DebugPrintf("l3-tunnel incoming packet queue full; dropping packet len=%d", len(packet))
+		return true
+	}
+}
+
 func (c *l3TunnelConn) heartbeatLoop() {
-	ticker := time.NewTicker(25 * time.Second)
+	interval := c.heartbeatInterval
+	if interval <= 0 {
+		interval = defaultHeartbeatInterval
+	}
+	missLimit := c.heartbeatMissLimit
+	if missLimit <= 0 {
+		missLimit = defaultHeartbeatMissLimit
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			_ = c.writeFrame([]byte{l3Version, cmdHeartbeatReq, 0x00, 0x00})
+			c.conntrackMgr.removeExpired()
+			misses := atomic.LoadInt32(&c.heartbeatMisses)
+			if misses >= missLimit {
+				log.DebugPrintf("l3-tunnel heartbeat timed out after %d missed responses", misses)
+				_ = c.Close()
+				return
+			}
+			if !c.sendHeartbeat() {
+				return
+			}
 		case <-c.closeCh:
 			return
 		}
 	}
+}
+
+func (c *l3TunnelConn) sendHeartbeat() bool {
+	atomic.AddInt32(&c.heartbeatMisses, 1)
+	if err := c.writeFrame([]byte{l3Version, cmdHeartbeatReq, 0x00, 0x00}); err != nil {
+		log.DebugPrintf("l3-tunnel heartbeat write failed: %v", err)
+		_ = c.Close()
+		return false
+	}
+	return true
 }
 
 func (c *l3TunnelConn) readFrame() (frame, error) {
@@ -290,20 +368,25 @@ func (c *l3TunnelConn) readFrame() (frame, error) {
 						return frame{}, err
 					}
 				}
-				raw := append(append(header, statusLen...), payload...)
-				logFrame("recv", raw)
+				if log.DebugEnabled() {
+					raw := append(append(header, statusLen...), payload...)
+					logFrame("recv", raw)
+				}
 				return frame{cmd: cmd, status: status, payload: payload}, nil
 			}
 			if cmd == cmdDataResp {
-				payload, mode, err := readDataRespPayload(c.reader, c.dataMode)
+				payload, err := readDataRespPayload(c.reader)
 				if err != nil {
 					return frame{}, err
 				}
-				c.dataMode = mode
-				raw := append(append([]byte{}, header...), payload...)
-				logFrame("recv", raw)
-				log.DebugPrintf("l3-tunnel recv data resp mode=%s payloadLen=%d", mode, len(payload))
-				return frame{cmd: cmd, payload: payload, dataMode: mode}, nil
+				if log.DebugEnabled() {
+					lenBytes := make([]byte, 2)
+					binary.BigEndian.PutUint16(lenBytes, uint16(len(payload)))
+					raw := append(append(append([]byte{}, header...), lenBytes...), payload...)
+					logFrame("recv", raw)
+					log.DebugPrintf("l3-tunnel recv data resp payloadLen=%d", len(payload))
+				}
+				return frame{cmd: cmd, payload: payload}, nil
 			}
 
 			lenBytes := make([]byte, 2)
@@ -317,8 +400,10 @@ func (c *l3TunnelConn) readFrame() (frame, error) {
 					return frame{}, err
 				}
 			}
-			raw := append(append(header, lenBytes...), payload...)
-			logFrame("recv", raw)
+			if log.DebugEnabled() {
+				raw := append(append(header, lenBytes...), payload...)
+				logFrame("recv", raw)
+			}
 			return frame{cmd: cmd, payload: payload}, nil
 		}
 
@@ -334,8 +419,10 @@ func (c *l3TunnelConn) readFrame() (frame, error) {
 					return frame{}, err
 				}
 			}
-			raw := append(append(header, lenBytes...), payload...)
-			logFrame("recv protocol", raw)
+			if log.DebugEnabled() {
+				raw := append(append(header, lenBytes...), payload...)
+				logFrame("recv protocol", raw)
+			}
 			continue
 		}
 
@@ -355,40 +442,90 @@ func (c *l3TunnelConn) ReadPacket() ([]byte, error) {
 
 func (c *l3TunnelConn) WritePacket(meta packetMeta, appID, nodeGroupID string, pkt []byte) error {
 	ct := c.conntrackMgr.getOrCreate(meta.key, appID, nodeGroupID)
-	if err := c.ensureAuth(ct, meta); err != nil {
+	c.conntrackMgr.observePacket(meta.key, pkt, false)
+	ct.sendMu.Lock()
+	defer ct.sendMu.Unlock()
+
+	token, authErr, authenticated := c.conntrackMgr.authResult(ct)
+	if authenticated {
+		if authErr != nil {
+			return authErr
+		}
+		return c.writeAuthenticatedPacket(ct, meta, appID, nodeGroupID, token, pkt)
+	}
+
+	_, err := c.conntrackMgr.cachePacket(ct, meta, pkt)
+	if errors.Is(err, errPendingPacketCacheFull) {
+		log.DebugPrintf("l3-tunnel pending packet cache full for %s; dropping packet", ct.key)
+		return nil
+	}
+	if err != nil {
 		return err
 	}
-	token := ct.connectToken
+	c.notifyAuth()
+	return nil
+}
+
+func (c *l3TunnelConn) writeAuthenticatedPacket(ct *conntrack, meta packetMeta, appID, nodeGroupID, token string, pkt []byte) error {
 	if token == "" {
 		return fmt.Errorf("l3-tunnel missing connect token for %s", ct.key)
 	}
 	if len(token) > 0xFF {
 		return fmt.Errorf("l3-tunnel connect token too long: %d", len(token))
 	}
-	payload := buildDataPayload(token, [][]byte{pkt})
-	log.DebugPrintf("l3-tunnel send data meta=%s appID=%s group=%s authID=%d tokenLen=%d pktLen=%d payloadLen=%d", formatMeta(meta), appID, nodeGroupID, ct.authID, len(token), len(pkt), len(payload))
-	return c.writeFrame(payload)
+	frame := getDataPayload(token, pkt)
+	defer putDataPayload(frame)
+	payload := frame.payload
+	if log.DebugEnabled() {
+		log.DebugPrintf("l3-tunnel send data meta=%s appID=%s group=%s authID=%d tokenLen=%d pktLen=%d payloadLen=%d", formatMeta(meta), appID, nodeGroupID, ct.authID, len(token), len(pkt), len(payload))
+	}
+	err := c.writeFrame(payload)
+	return err
 }
 
-func (c *l3TunnelConn) ensureAuth(ct *conntrack, meta packetMeta) error {
+func (c *l3TunnelConn) notifyAuth() {
 	select {
-	case <-ct.authCh:
-		return ct.authErr
+	case c.authWake <- struct{}{}:
 	default:
 	}
+}
 
-	if atomic.CompareAndSwapUint32(&ct.authStarted, 0, 1) {
-		if err := c.sendAuthRequest(ct, meta); err != nil {
-			c.conntrackMgr.markAuth(ct.authID, "", err)
-			return err
+func (c *l3TunnelConn) authLoop() {
+	ticker := time.NewTicker(defaultAuthScanInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.authWake:
+			if !c.dispatchPendingAuth() {
+				return
+			}
+		case now := <-ticker.C:
+			if expired := c.conntrackMgr.expireAuth(now, errL3TunnelAuthTimeout); expired > 0 {
+				log.DebugPrintf("l3-tunnel exhausted retries for %d pending authentications", expired)
+			}
+			if !c.dispatchPendingAuth() {
+				return
+			}
+		case <-c.closeCh:
+			return
 		}
 	}
+}
 
-	select {
-	case <-ct.authCh:
-		return ct.authErr
-	case <-time.After(8 * time.Second):
-		return fmt.Errorf("%w for %s", errL3TunnelAuthTimeout, ct.key)
+func (c *l3TunnelConn) dispatchPendingAuth() bool {
+	for {
+		jobs, more := c.conntrackMgr.nextAuthBatch(defaultAuthBatchSize)
+		for _, job := range jobs {
+			if err := c.sendAuthRequest(job.conntrack, job.meta); err != nil {
+				c.conntrackMgr.markAuth(job.conntrack.authID, "", err)
+				_ = c.Close()
+				return false
+			}
+			c.conntrackMgr.markAuthSent(job.conntrack.authID, time.Now().Add(defaultAuthTimeout))
+		}
+		if !more {
+			return true
+		}
 	}
 }
 
@@ -397,7 +534,9 @@ func (c *l3TunnelConn) sendAuthRequest(ct *conntrack, meta packetMeta) error {
 	if err != nil {
 		return err
 	}
-	log.DebugPrintf("l3-tunnel send auth authID=%d meta=%s payloadLen=%d", ct.authID, formatMeta(meta), len(req))
+	if log.DebugEnabled() {
+		log.DebugPrintf("l3-tunnel send auth authID=%d meta=%s payloadLen=%d", ct.authID, formatMeta(meta), len(req))
+	}
 	payload := make([]byte, 0, 4+len(req))
 	payload = append(payload, l3Version, cmdAuthReq)
 	lenBytes := make([]byte, 2)
@@ -408,11 +547,6 @@ func (c *l3TunnelConn) sendAuthRequest(ct *conntrack, meta packetMeta) error {
 }
 
 func (c *l3TunnelConn) handleAuthResp(status byte, payload []byte) {
-	if status != 0 {
-		c.markAuthErrorFromPayload(payload, fmt.Errorf("auth status %d", status))
-		return
-	}
-
 	var resp authResponseIP
 	if err := json.Unmarshal(payload, &resp); err != nil {
 		c.markAuthErrorFromPayload(payload, err)
@@ -422,9 +556,21 @@ func (c *l3TunnelConn) handleAuthResp(status byte, payload []byte) {
 		c.markAuthErrorFromPayload(payload, fmt.Errorf("missing conntrack hash"))
 		return
 	}
+	if status != 0 {
+		if isRetryableAuthResponse(status, resp) {
+			c.scheduleAuthRetry(resp.Data.ConntrackHash, defaultAuthRetryWait)
+			return
+		}
+		c.completeAuthentication(resp.Data.ConntrackHash, "", fmt.Errorf("auth status %d: %s", status, resp.Message))
+		return
+	}
 
 	var err error
 	if resp.Code != 0 {
+		if isRetryableAuthResponse(status, resp) {
+			c.scheduleAuthRetry(resp.Data.ConntrackHash, defaultAuthRetryWait)
+			return
+		}
 		err = fmt.Errorf("auth failed: %d %s", resp.Code, resp.Message)
 	}
 	token := strings.TrimSpace(resp.Data.ConnectToken)
@@ -435,12 +581,17 @@ func (c *l3TunnelConn) handleAuthResp(status byte, payload []byte) {
 		err = fmt.Errorf("missing connect token")
 	}
 	log.DebugPrintf("l3-tunnel auth resp code=%d conntrack=%d tokenLen=%d", resp.Code, resp.Data.ConntrackHash, len(token))
-	c.conntrackMgr.markAuth(resp.Data.ConntrackHash, token, err)
+	c.completeAuthentication(resp.Data.ConntrackHash, token, err)
+}
 
-	if err == nil {
-		if atomic.CompareAndSwapUint32(&c.vipRequested, 0, 1) {
-			//_ = c.writeFrame([]byte{l3Version, cmdSecondVipReq}) // TODO: figure out when should we request second VIP
-		}
+func isRetryableAuthResponse(status byte, resp authResponseIP) bool {
+	return status == authServerBusyCode || resp.Code == authServerBusyCode
+}
+
+func (c *l3TunnelConn) scheduleAuthRetry(authID uint64, delay time.Duration) {
+	if c.conntrackMgr.retryAuth(authID, delay) {
+		log.DebugPrintf("l3-tunnel auth retry scheduled authID=%d delay=%s", authID, delay)
+		c.notifyAuth()
 	}
 }
 
@@ -461,15 +612,41 @@ func (c *l3TunnelConn) handleSecondVipResp(status byte, payload []byte) {
 func (c *l3TunnelConn) markAuthErrorFromPayload(payload []byte, err error) {
 	var resp authResponseIP
 	if json.Unmarshal(payload, &resp) == nil && resp.Data.ConntrackHash != 0 {
-		c.conntrackMgr.markAuth(resp.Data.ConntrackHash, "", err)
+		c.completeAuthentication(resp.Data.ConntrackHash, "", err)
+	}
+}
+
+func (c *l3TunnelConn) completeAuthentication(authID uint64, token string, authErr error) {
+	ct := c.conntrackMgr.getByID(authID)
+	if ct == nil {
+		return
+	}
+	ct.sendMu.Lock()
+	defer ct.sendMu.Unlock()
+	_, packets := c.conntrackMgr.completeAuth(authID, token, authErr)
+	if authErr != nil {
+		return
+	}
+	for _, packet := range packets {
+		if err := c.writeAuthenticatedPacket(ct, ct.authMeta, ct.appID, ct.nodeGroupID, token, packet); err != nil {
+			log.DebugPrintf("l3-tunnel flush authenticated packet failed: %v", err)
+			_ = c.Close()
+			return
+		}
 	}
 }
 
 func (c *l3TunnelConn) writeFrame(data []byte) error {
+	if c.writeFrameHook != nil {
+		return c.writeFrameHook(data)
+	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	logFrame("send", data)
-	_, err := c.tlsConn.Write(data)
+	n, err := c.tlsConn.Write(data)
+	if err == nil && n != len(data) {
+		return io.ErrShortWrite
+	}
 	return err
 }
 
@@ -560,28 +737,32 @@ func encodeMeta(meta packetMeta) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func buildDataPayload(token string, packets [][]byte) []byte {
-	tokenBytes := []byte(token)
-	payloadLen := 1 + len(tokenBytes) + 2 + 1
-	for _, pkt := range packets {
-		payloadLen += 2 + len(pkt)
+func getDataPayload(token string, packet []byte) *dataFrame {
+	frame := dataFramePool.Get().(*dataFrame)
+	payload := frame.payload[:0]
+	required := 8 + len(token) + len(packet)
+	if cap(payload) < required {
+		payload = make([]byte, 0, required)
 	}
-	payload := make([]byte, 0, payloadLen+2)
-	payload = append(payload, l3Version, cmdDataReq)
-	payload = append(payload, byte(len(tokenBytes)))
-	payload = append(payload, tokenBytes...)
-	payload = append(payload, 0x00, 0x00)
-	payload = append(payload, byte(len(packets)))
-	for _, pkt := range packets {
-		lenBytes := make([]byte, 2)
-		binary.BigEndian.PutUint16(lenBytes, uint16(len(pkt)))
-		payload = append(payload, lenBytes...)
-		payload = append(payload, pkt...)
-	}
-	return payload
+	payload = append(payload, l3Version, cmdDataReq, byte(len(token)))
+	payload = append(payload, token...)
+	payload = append(payload, 0x00, 0x00, 0x01, 0x00, 0x00)
+	binary.BigEndian.PutUint16(payload[len(payload)-2:], uint16(len(packet)))
+	payload = append(payload, packet...)
+	frame.payload = payload
+	return frame
 }
 
-const maxDataPayload = 4096
+func putDataPayload(frame *dataFrame) {
+	// Avoid retaining unexpectedly large packets in the process-wide pool.
+	if cap(frame.payload) > maxPooledDataPayload {
+		return
+	}
+	frame.payload = frame.payload[:0]
+	dataFramePool.Put(frame)
+}
+
+const maxPooledDataPayload = 4096
 
 func parseDataPayload(payload []byte) ([][]byte, error) {
 	if len(payload) < 4 {
@@ -614,136 +795,53 @@ func parseDataPayload(payload []byte) ([][]byte, error) {
 	return packets, nil
 }
 
-func parseLengthDataStream(payload []byte) ([][]byte, []byte, error) {
-	packets := make([][]byte, 0, 1)
-	for len(payload) > 0 {
-		if len(payload) < 20 {
-			return packets, append([]byte(nil), payload...), nil
-		}
-		if payload[0]>>4 != 4 {
-			return nil, nil, fmt.Errorf("unexpected ip version %d", payload[0]>>4)
-		}
-		headerLen := int(payload[0]&0x0f) * 4
-		if headerLen < 20 || headerLen > len(payload) {
-			return nil, nil, fmt.Errorf("invalid ipv4 header length %d", headerLen)
-		}
-		packetLen := int(binary.BigEndian.Uint16(payload[2:4]))
-		if packetLen < headerLen {
-			return nil, nil, fmt.Errorf("invalid ipv4 packet length %d", packetLen)
-		}
-		if packetLen > len(payload) {
-			return packets, append([]byte(nil), payload...), nil
-		}
-		packet := make([]byte, packetLen)
-		copy(packet, payload[:packetLen])
-		packets = append(packets, packet)
-		payload = payload[packetLen:]
-	}
-	return packets, nil, nil
-}
-
-func readDataRespPayload(r *bufio.Reader, establishedMode string) ([]byte, string, error) {
-	if establishedMode == "token" {
-		payload, err := readTokenDataRespPayload(r)
-		return payload, "token", err
-	}
-
-	peek, err := r.Peek(2)
-	if err != nil {
-		return nil, "", err
-	}
-	payloadLen := int(binary.BigEndian.Uint16(peek))
-	// The protocol has two data-response encodings. The token-envelope form
-	// starts with a one-byte token length, so its first two bytes can also look
-	// like a small big-endian payload length. A length-prefixed response may
-	// contain several concatenated IPv4 packets, so the first packet's total
-	// length only needs to fit inside the outer payload length.
-	isLengthPayload := establishedMode == "len" ||
-		(payloadLen > 0 && payloadLen <= maxDataPayload && hasIPv4PayloadStart(r, payloadLen))
-	if isLengthPayload {
-		if payloadLen <= 0 || payloadLen > maxDataPayload {
-			return nil, "", fmt.Errorf("invalid length data payload size %d", payloadLen)
-		}
-		if _, err := r.Discard(2); err != nil {
-			return nil, "", err
-		}
-		payload := make([]byte, payloadLen)
-		if payloadLen > 0 {
-			if _, err := io.ReadFull(r, payload); err != nil {
-				return nil, "", err
-			}
-		}
-		return payload, "len", nil
-	}
-	payload, err := readTokenDataRespPayload(r)
-	return payload, "token", err
-}
-
-func readTokenDataRespPayload(r *bufio.Reader) ([]byte, error) {
-	tokenLen, err := r.ReadByte()
-	if err != nil {
+func readDataRespPayload(r *bufio.Reader) ([]byte, error) {
+	var lenBytes [2]byte
+	if _, err := io.ReadFull(r, lenBytes[:]); err != nil {
 		return nil, err
 	}
-	payload := []byte{tokenLen}
-	if tokenLen > 0 {
-		token := make([]byte, int(tokenLen))
-		if _, err := io.ReadFull(r, token); err != nil {
-			return nil, err
-		}
-		payload = append(payload, token...)
-	}
-	reserved := make([]byte, 2)
-	if _, err := io.ReadFull(r, reserved); err != nil {
+	payload := make([]byte, int(binary.BigEndian.Uint16(lenBytes[:])))
+	if _, err := io.ReadFull(r, payload); err != nil {
 		return nil, err
-	}
-	payload = append(payload, reserved...)
-	count, err := r.ReadByte()
-	if err != nil {
-		return nil, err
-	}
-	payload = append(payload, count)
-	for i := 0; i < int(count); i++ {
-		lenBytes := make([]byte, 2)
-		if _, err := io.ReadFull(r, lenBytes); err != nil {
-			return nil, err
-		}
-		payload = append(payload, lenBytes...)
-		plen := int(binary.BigEndian.Uint16(lenBytes))
-		if plen == 0 {
-			continue
-		}
-		pkt := make([]byte, plen)
-		if _, err := io.ReadFull(r, pkt); err != nil {
-			return nil, err
-		}
-		payload = append(payload, pkt...)
 	}
 	return payload, nil
 }
 
-// hasIPv4PayloadStart proves that the bytes after a data-frame length begin
-// with a complete IPv4 packet that fits inside that frame. It peeks only the
-// fixed header, so an ambiguous token frame cannot make the reader wait for a
-// fictitious multi-kilobyte payload.
-func hasIPv4PayloadStart(r *bufio.Reader, payloadLen int) bool {
-	if payloadLen < 20 {
-		return false
+const maxIncomingIPPacketSize = 1500
+
+func splitIncomingIPPackets(stream []byte) ([][]byte, []byte, error) {
+	var packets [][]byte
+	for len(stream) > 0 {
+		var packetLen int
+		switch stream[0] >> 4 {
+		case zctcpip.IPv4Version:
+			if len(stream) < 4 {
+				return packets, stream, nil
+			}
+			headerLen := int(stream[0]&0x0f) * 4
+			packetLen = int(binary.BigEndian.Uint16(stream[2:4]))
+			if headerLen < 20 || packetLen < headerLen {
+				return nil, nil, fmt.Errorf("invalid IPv4 packet length %d with header length %d", packetLen, headerLen)
+			}
+		case 6:
+			if len(stream) < 6 {
+				return packets, stream, nil
+			}
+			packetLen = 40 + int(binary.BigEndian.Uint16(stream[4:6]))
+		default:
+			return nil, nil, fmt.Errorf("unexpected IP version %d", stream[0]>>4)
+		}
+		if packetLen > maxIncomingIPPacketSize {
+			return nil, nil, fmt.Errorf("IP packet length %d exceeds %d", packetLen, maxIncomingIPPacketSize)
+		}
+		if len(stream) < packetLen {
+			return packets, stream, nil
+		}
+		packet := append([]byte(nil), stream[:packetLen]...)
+		packets = append(packets, packet)
+		stream = stream[packetLen:]
 	}
-	frame, err := r.Peek(2 + 20)
-	if err != nil {
-		return false
-	}
-	header := frame[2:]
-	version := header[0] >> 4
-	headerLen := int(header[0]&0x0f) * 4
-	packetLen := int(binary.BigEndian.Uint16(header[2:4]))
-	if version != 4 {
-		return false
-	}
-	if headerLen < 20 || headerLen > payloadLen {
-		return false
-	}
-	return packetLen >= headerLen && packetLen <= payloadLen
+	return packets, nil, nil
 }
 
 func parseDataMeta(payload []byte) (packetMeta, int, error) {
@@ -799,6 +897,9 @@ func formatMeta(meta packetMeta) string {
 }
 
 func logFrame(prefix string, data []byte) {
+	if !log.DebugEnabled() {
+		return
+	}
 	if len(data) >= 2 {
 		log.DebugPrintf("l3-tunnel %s frame cmd=0x%02x len=%d", prefix, data[1], len(data))
 	} else {
@@ -866,14 +967,9 @@ func (c *l3TunnelConn) authTunnel() error {
 	}
 	log.DebugPrintf("l3-tunnel recv tunnel vip header len=%d", len(vipHeader))
 	log.DebugDumpHex(vipHeader)
-	if vipHeader[0] != l3Version {
-		return nil
-	}
-
-	addrType := vipHeader[3]
-	dataLen := vipPayloadLength(addrType)
-	if dataLen == 0 {
-		return nil
+	dataLen, err := parseInitialVIPHeader(vipHeader)
+	if err != nil {
+		return err
 	}
 	vipData := make([]byte, dataLen)
 	if _, err := io.ReadFull(c.reader, vipData); err != nil {
@@ -902,16 +998,28 @@ func wrapAuthReqData(payload []byte, addrType byte) []byte {
 	return buf
 }
 
-func vipPayloadLength(addrType byte) int {
-	switch addrType {
+func parseInitialVIPHeader(header []byte) (int, error) {
+	if len(header) != 4 {
+		return 0, fmt.Errorf("l3-tunnel invalid vip header length %d", len(header))
+	}
+	if header[0] != l3Version {
+		return 0, fmt.Errorf("l3-tunnel unexpected vip version: %02x", header[0])
+	}
+	if header[1] != 0 {
+		return 0, fmt.Errorf("l3-tunnel vip status %d", header[1])
+	}
+	if header[2] != 0 {
+		return 0, fmt.Errorf("l3-tunnel invalid vip reserved byte %d", header[2])
+	}
+	switch header[3] {
 	case 1:
-		return 6
+		return 6, nil
 	case 4:
-		return 18
+		return 18, nil
 	case 5:
-		return 22
+		return 22, nil
 	default:
-		return 4
+		return 0, fmt.Errorf("l3-tunnel unsupported vip address type %d", header[3])
 	}
 }
 
@@ -930,34 +1038,31 @@ func parseVirtualIPData(data []byte) []net.IP {
 }
 
 func extractVIPs(payload []byte) []net.IP {
-	var data interface{}
-	if err := json.Unmarshal(payload, &data); err != nil {
+	type virtualIPs struct {
+		VIP      string `json:"vip"`
+		VIP6     string `json:"vip6"`
+		VIPType  any    `json:"vip_type"`
+		VIP6Type any    `json:"vip6_type"`
+	}
+	var resp struct {
+		virtualIPs
+		Data virtualIPs `json:"data"`
+	}
+	if err := json.Unmarshal(payload, &resp); err != nil {
 		return nil
 	}
-
-	ips := make([]net.IP, 0)
-	visitJSONValues(data, func(val string) {
-		ip := net.ParseIP(val)
-		if ip != nil {
-			ips = append(ips, ip)
-		}
-	})
-	return ips
-}
-
-func visitJSONValues(v interface{}, visit func(string)) {
-	switch value := v.(type) {
-	case map[string]interface{}:
-		for _, item := range value {
-			visitJSONValues(item, visit)
-		}
-	case []interface{}:
-		for _, item := range value {
-			visitJSONValues(item, visit)
-		}
-	case string:
-		visit(value)
+	values := resp.virtualIPs
+	if values.VIP == "" && values.VIP6 == "" {
+		values = resp.Data
 	}
+	ips := make([]net.IP, 0, 2)
+	if ip := net.ParseIP(values.VIP); ip != nil && ip.To4() != nil {
+		ips = append(ips, ip.To4())
+	}
+	if ip := net.ParseIP(values.VIP6); ip != nil && ip.To4() == nil {
+		ips = append(ips, ip.To16())
+	}
+	return ips
 }
 
 func protoName(proto int) string {
@@ -1016,5 +1121,5 @@ func firstNonEmpty(values ...string) string {
 }
 
 func connTrackKey(meta packetMeta) string {
-	return fmt.Sprintf("%d:%s:%d-%s:%d", meta.atype, meta.srcIP.String(), meta.srcPort, meta.dstIP.String(), meta.dstPort)
+	return fmt.Sprintf("%d:%d:%s:%d-%s:%d", meta.atype, meta.proto, meta.srcIP.String(), meta.srcPort, meta.dstIP.String(), meta.dstPort)
 }

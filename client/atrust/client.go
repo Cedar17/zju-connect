@@ -17,6 +17,7 @@ import (
 
 	"github.com/mythologyli/zju-connect/client"
 	"github.com/mythologyli/zju-connect/client/atrust/auth"
+	"github.com/mythologyli/zju-connect/internal/ipresource"
 	"github.com/mythologyli/zju-connect/internal/underlay"
 	"github.com/mythologyli/zju-connect/log"
 	"inet.af/netaddr"
@@ -31,17 +32,23 @@ type Client struct {
 
 	serverAddress   string
 	ipResources     []client.IPResource
-	domainResources map[string]client.DomainResource
+	resourceIndex   *ipresource.Index
+	domainResources client.DomainResources
 	ipSet           *netaddr.IPSet
-	dnsResource     map[string]net.IP
+	dnsResource     map[string][]net.IP
 	dnsServer       string
+	dnsServers      []string
 
 	MajorNodeGroup   string
-	NodeGroups       map[string][]string
+	NodeGroups       map[string]NodeGroup
 	BestNodes        map[string]string
 	BestNodesRWMutex sync.RWMutex
 
-	ip net.IP // Client IP
+	ipMu sync.RWMutex
+	ip   net.IP // Client IP
+
+	ipUpdateMu      sync.RWMutex
+	ipUpdateHandler func(net.IP) error
 
 	l3Tunnel   *L3Tunnel
 	l3TunnelMu sync.Mutex
@@ -52,6 +59,12 @@ type Client struct {
 	underlayDialer  *underlay.Dialer
 	nodeTLSMu       sync.RWMutex
 	nodeTLSConfig   *tls.Config
+
+	skipTCPTunnelWait bool
+}
+
+func (c *Client) SetSkipTCPTunnelWait(skip bool) {
+	c.skipTCPTunnelWait = skip
 }
 
 func NewClient(username, sid, deviceID, signKey string) *Client {
@@ -121,11 +134,35 @@ func (c *Client) Close() {
 }
 
 func (c *Client) IP() (net.IP, error) {
+	c.ipMu.RLock()
+	defer c.ipMu.RUnlock()
 	if c.ip == nil {
 		return nil, errors.New("IP not available")
 	}
 
-	return c.ip.To4(), nil
+	return append(net.IP(nil), c.ip.To4()...), nil
+}
+
+func (c *Client) setIP(ip net.IP) {
+	c.ipMu.Lock()
+	c.ip = append(net.IP(nil), ip...)
+	c.ipMu.Unlock()
+}
+
+func (c *Client) SetIPUpdateHandler(handler func(net.IP) error) {
+	c.ipUpdateMu.Lock()
+	c.ipUpdateHandler = handler
+	c.ipUpdateMu.Unlock()
+}
+
+func (c *Client) applyIPUpdate(ip net.IP) error {
+	c.ipUpdateMu.RLock()
+	handler := c.ipUpdateHandler
+	c.ipUpdateMu.RUnlock()
+	if handler == nil {
+		return errors.New("network stack does not support virtual IP updates")
+	}
+	return handler(append(net.IP(nil), ip...))
 }
 
 func (c *Client) IPSet() (*netaddr.IPSet, error) {
@@ -144,7 +181,7 @@ func (c *Client) IPResources() ([]client.IPResource, error) {
 	return c.ipResources, nil
 }
 
-func (c *Client) DomainResources() (map[string]client.DomainResource, error) {
+func (c *Client) DomainResources() (client.DomainResources, error) {
 	if c.domainResources == nil {
 		return nil, errors.New("domain resources not available")
 	}
@@ -152,7 +189,7 @@ func (c *Client) DomainResources() (map[string]client.DomainResource, error) {
 	return c.domainResources, nil
 }
 
-func (c *Client) DNSResource() (map[string]net.IP, error) {
+func (c *Client) DNSResource() (map[string][]net.IP, error) {
 	if c.dnsResource == nil {
 		return nil, errors.New("DNS resource not available")
 	}
@@ -166,6 +203,13 @@ func (c *Client) DNSServer() (string, error) {
 	}
 
 	return c.dnsServer, nil
+}
+
+func (c *Client) DNSServers() ([]string, error) {
+	if len(c.dnsServers) == 0 {
+		return nil, errors.New("DNS servers not available")
+	}
+	return append([]string(nil), c.dnsServers...), nil
 }
 
 func randHex(n int) string {
@@ -227,10 +271,12 @@ func SetTrusted(serverAddress string, serverPort int, authData []byte, trusted b
 	dialer := newUnderlayDialer(serverHost, bindInterface, autoDetectInterface)
 	sess := auth.NewSession(serverHost, dialer.DialContext)
 
-	sess.Login(nil, auth.LoginOptions{
+	if _, err := sess.Login(nil, auth.LoginOptions{
 		DeviceID: clientAuthData.DeviceID,
 		Cookies:  clientAuthData.Cookies,
-	})
+	}); err != nil {
+		return err
+	}
 	result, err := sess.QueryDevice()
 	if err != nil {
 		return err
@@ -251,7 +297,7 @@ func SetTrusted(serverAddress string, serverPort int, authData []byte, trusted b
 	}
 }
 
-func (c *Client) Setup(serverAddress string, serverPort int, username, password, phone, loginDomain, authType, graphCodeFile, casTicket, oauth2Code string, authData, resourceData []byte, updateBestNodesInterval int, bindInterface string, autoDetectInterface bool) ([]byte, error) {
+func (c *Client) Setup(serverAddress string, serverPort int, username, password, phone, loginDomain, authType, graphCodeFile, casTicket, oauth2Code, totpSecret string, authData, resourceData []byte, updateBestNodesInterval int, bindInterface string, autoDetectInterface bool) ([]byte, error) {
 	c.serverAddress = serverAddress
 	serverHost := net.JoinHostPort(serverAddress, fmt.Sprint(serverPort))
 	c.underlayDialer = newUnderlayDialer(serverHost, bindInterface, autoDetectInterface)
@@ -329,8 +375,9 @@ func (c *Client) Setup(serverAddress string, serverPort int, username, password,
 		}
 
 		loginResult, err := sess.Login(loginMethod, auth.LoginOptions{
-			DeviceID: c.DeviceID,
-			Cookies:  clientAuthData.Cookies,
+			DeviceID:   c.DeviceID,
+			Cookies:    clientAuthData.Cookies,
+			TOTPSecret: totpSecret,
 		})
 		if err != nil {
 			log.Println("Login error:", err)

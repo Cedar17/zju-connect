@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -70,6 +71,8 @@ type Session struct {
 	cancelRequests    context.CancelFunc
 	connectionTracker *connectionTracker
 	deviceID          string
+	username          string
+	totpSecret        string
 
 	baseHost string
 	baseURL  string
@@ -86,6 +89,10 @@ type Session struct {
 }
 
 func NewSession(server string, dialContext ...func(context.Context, string, string) (net.Conn, error)) *Session {
+	return newSession(server, nil, dialContext...)
+}
+
+func newSession(server string, tlsConfig *tls.Config, dialContext ...func(context.Context, string, string) (net.Conn, error)) *Session {
 	// Leave TLS verification enabled. The Android client must reject an
 	// untrusted certificate or a hostname mismatch before credentials are sent.
 	baseDialContext := (&net.Dialer{}).DialContext
@@ -94,11 +101,12 @@ func NewSession(server string, dialContext ...func(context.Context, string, stri
 	}
 	connectionTracker := newConnectionTracker(baseDialContext)
 	tr := &http.Transport{DialContext: connectionTracker.dialContext}
+	if tlsConfig != nil {
+		tr.TLSClientConfig = tlsConfig.Clone()
+	}
 	jar, _ := cookiejar.New(nil)
 	client := &http.Client{Transport: tr, Jar: jar, Timeout: 20 * time.Second}
 	requestContext, cancelRequests := context.WithCancel(context.Background())
-
-	rid := base64.StdEncoding.EncodeToString([]byte(server))
 
 	return &Session{
 		client:            client,
@@ -107,21 +115,17 @@ func NewSession(server string, dialContext ...func(context.Context, string, stri
 		connectionTracker: connectionTracker,
 		baseHost:          server,
 		baseURL:           "https://" + server,
-		rid:               rid,
+		rid:               base64.StdEncoding.EncodeToString([]byte(server)),
 		response:          make(map[string]json.RawMessage),
 	}
 }
 
 // do binds every authentication request to the session lifetime. Cancelling
-// the session interrupts active dials, TLS handshakes, and response reads;
-// unlike CloseIdleConnections alone, it does not wait for the HTTP timeout.
+// the session interrupts active dials, TLS handshakes, and response reads.
 func (s *Session) do(request *http.Request) (*http.Response, error) {
 	return s.client.Do(request.WithContext(s.requestContext))
 }
 
-// cancel interrupts all requests made by this session. It is safe to call
-// repeatedly and is intentionally package-private: the interactive Android
-// flow owns the decision to discard an authentication session.
 func (s *Session) cancel() {
 	s.cancelRequests()
 	s.connectionTracker.closeAll()
@@ -200,8 +204,9 @@ type AuthInfo struct {
 }
 
 type LoginOptions struct {
-	DeviceID string
-	Cookies  []Cookie
+	DeviceID   string
+	Cookies    []Cookie
+	TOTPSecret string
 }
 
 type LoginResult struct {
@@ -308,6 +313,20 @@ func (s *Session) continueAuth(step authStep) error {
 			step, err = s.completeSMS(step)
 		case "auth/customSms":
 			step, err = s.completeCustomSMS()
+		case "auth/totp":
+			step, err = s.completeTOTP()
+		case "auth/radius":
+			step, err = s.completeRadius("auth/token")
+		case "auth/challenge":
+			step, err = s.completeRadius("auth/challenge")
+		case "auth/accessCheck":
+			step, err = s.accessCheck()
+		case "auth/preEnhancedAuth", "auth/enhancedConfirm", "auth/enhancedDone":
+			step, err = s.completeEnhancedAuth(step)
+		case "auth/bindAuthDevice":
+			step, err = s.bindAuthDevice(step)
+		case "auth/token":
+			return fmt.Errorf("token authentication type is missing")
 		default:
 			return fmt.Errorf("unsupported next authentication service: %s", step.Service)
 		}
@@ -370,6 +389,7 @@ func (s *Session) Login(method LoginMethod, opts LoginOptions) (LoginResult, err
 	}
 
 	s.deviceID = opts.DeviceID
+	s.totpSecret = opts.TOTPSecret
 	s.env = base64.StdEncoding.EncodeToString([]byte(`{"deviceId":"` + opts.DeviceID + `"}`))
 
 	isLogin, authInfoList, err := s.authConfig(false, true)
