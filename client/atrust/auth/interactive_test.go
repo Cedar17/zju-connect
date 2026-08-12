@@ -29,6 +29,34 @@ func TestNewSessionRejectsUntrustedCertificate(t *testing.T) {
 	}
 }
 
+func TestInteractiveFlowOptionsEnforceStrictTLS(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer server.Close()
+	host := strings.TrimPrefix(server.URL, "https://")
+	deviceID := strings.Repeat("a", 32)
+
+	strict, err := NewInteractiveFlowWithOptions(host, InteractiveFlowOptions{
+		DeviceID:  deviceID,
+		StrictTLS: true,
+	})
+	if err != nil {
+		t.Fatalf("NewInteractiveFlowWithOptions(strict): %v", err)
+	}
+	if _, err := strict.session.client.Get(server.URL); err == nil {
+		t.Fatal("strict interactive flow accepted an untrusted certificate")
+	}
+
+	compatible, err := NewInteractiveFlowWithOptions(host, InteractiveFlowOptions{
+		DeviceID: deviceID,
+	})
+	if err != nil {
+		t.Fatalf("NewInteractiveFlowWithOptions(compatible): %v", err)
+	}
+	if _, err := compatible.session.client.Get(server.URL); err != nil {
+		t.Fatalf("explicit non-strict compatibility flow rejected test certificate: %v", err)
+	}
+}
+
 func TestInteractiveFlowPasswordCompletesWithoutLeakingResult(t *testing.T) {
 	server := newInteractiveTestServer(t, interactiveScenario{})
 	defer server.Close()

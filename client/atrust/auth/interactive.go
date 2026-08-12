@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -36,6 +37,14 @@ type InteractiveResult struct {
 	SID          string
 	AuthData     []byte
 	ResourceData []byte
+}
+
+// InteractiveFlowOptions configures caller-owned authentication identity and
+// transport verification. Android callers must set StrictTLS so the system CA
+// pool and hostname verification run before application-layer anti-MITM checks.
+type InteractiveFlowOptions struct {
+	DeviceID  string
+	StrictTLS bool
 }
 
 type interactiveState string
@@ -93,23 +102,38 @@ func NewInteractiveFlow(server string, dialContext ...func(context.Context, stri
 	if err != nil {
 		return nil, fmt.Errorf("generate device id: %w", err)
 	}
-	return newInteractiveFlow(server, deviceID, false, dialContext...), nil
+	return newInteractiveFlow(server, deviceID, false, true, dialContext...), nil
 }
 
 // NewInteractiveFlowWithDeviceID creates an interactive flow whose device
 // identity is owned by the caller. Restored snapshots cannot replace it.
 func NewInteractiveFlowWithDeviceID(server, deviceID string, dialContext ...func(context.Context, string, string) (net.Conn, error)) (*InteractiveFlow, error) {
+	return NewInteractiveFlowWithOptions(server, InteractiveFlowOptions{
+		DeviceID:  deviceID,
+		StrictTLS: true,
+	}, dialContext...)
+}
+
+// NewInteractiveFlowWithOptions creates a caller-configured interactive flow.
+// It keeps the legacy constructors intact while making Android's stable device
+// identity and strict TLS policy explicit at the bridge boundary.
+func NewInteractiveFlowWithOptions(server string, options InteractiveFlowOptions, dialContext ...func(context.Context, string, string) (net.Conn, error)) (*InteractiveFlow, error) {
+	deviceID := options.DeviceID
 	if len(deviceID) != 32 {
 		return nil, fmt.Errorf("device id must contain 32 hexadecimal characters")
 	}
 	if _, err := hex.DecodeString(deviceID); err != nil {
 		return nil, fmt.Errorf("device id is not hexadecimal: %w", err)
 	}
-	return newInteractiveFlow(server, deviceID, true, dialContext...), nil
+	return newInteractiveFlow(server, deviceID, true, options.StrictTLS, dialContext...), nil
 }
 
-func newInteractiveFlow(server, deviceID string, locked bool, dialContext ...func(context.Context, string, string) (net.Conn, error)) *InteractiveFlow {
-	newSession := func() *Session { return NewSession(server, dialContext...) }
+func newInteractiveFlow(server, deviceID string, locked, strictTLS bool, dialContext ...func(context.Context, string, string) (net.Conn, error)) *InteractiveFlow {
+	var tlsConfig *tls.Config
+	if !strictTLS {
+		tlsConfig = &tls.Config{InsecureSkipVerify: true} // #nosec G402 -- opt-in compatibility for non-Android callers.
+	}
+	newSession := func() *Session { return newSession(server, tlsConfig, dialContext...) }
 	return &InteractiveFlow{
 		session:        newSession(),
 		newSession:     newSession,
