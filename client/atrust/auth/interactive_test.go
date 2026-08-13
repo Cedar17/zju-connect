@@ -115,6 +115,62 @@ func TestInteractiveFlowPasswordCaptchaAndSecondarySMS(t *testing.T) {
 	}
 }
 
+func TestInteractiveFlowExpiredSessionReauthenticatesWithSecondarySMSOnly(t *testing.T) {
+	server := newInteractiveTestServer(t, interactiveScenario{secondarySMS: true})
+	defer server.Close()
+
+	host := strings.TrimPrefix(server.URL, "https://")
+	const deviceID = "11111111111111111111111111111111"
+	flow, err := NewInteractiveFlowWithDeviceID(host, deviceID)
+	if err != nil {
+		t.Fatalf("NewInteractiveFlowWithDeviceID: %v", err)
+	}
+	trustInteractiveFlow(t, flow, server)
+
+	authData, err := json.Marshal(ClientAuthData{
+		DeviceID: "22222222222222222222222222222222",
+		Cookies:  []Cookie{{Host: host, Scheme: "https", Name: "sid", Value: "expired-session-cookie"}},
+	})
+	if err != nil {
+		t.Fatalf("Marshal auth data: %v", err)
+	}
+
+	prompt, err := flow.Resume(authData)
+	if err != nil || prompt.State != string(interactiveAwaitingMethod) || prompt.Code != "sessionExpired" {
+		t.Fatalf("Resume() = %#v, %v", prompt, err)
+	}
+	if _, err := flow.SelectMethod("auth/psw", "Radius"); err != nil {
+		t.Fatalf("SelectMethod: %v", err)
+	}
+
+	prompt, err = flow.SubmitCredentials("student", "saved-password")
+	if err != nil || prompt.State != string(interactiveAwaitingSMS) {
+		t.Fatalf("SubmitCredentials() = %#v, %v, want SMS without captcha", prompt, err)
+	}
+	if prompt.CaptchaWidth != 0 || prompt.CaptchaHeight != 0 {
+		t.Fatalf("SMS-only prompt exposed captcha dimensions: %#v", prompt)
+	}
+	if _, err := flow.PendingCaptchaImage(); err == nil {
+		t.Fatal("SMS-only reauthentication exposed a captcha image")
+	}
+
+	prompt, err = flow.SubmitSMSCode("123456")
+	if err != nil || prompt.State != string(interactiveAuthenticated) {
+		t.Fatalf("SubmitSMSCode() = %#v, %v", prompt, err)
+	}
+	result, ok := flow.Result()
+	if !ok {
+		t.Fatal("SMS-only reauthentication did not produce a result")
+	}
+	var refreshed ClientAuthData
+	if err := json.Unmarshal(result.AuthData, &refreshed); err != nil {
+		t.Fatalf("Unmarshal refreshed auth data: %v", err)
+	}
+	if refreshed.DeviceID != deviceID {
+		t.Fatalf("device ID = %q, want stable caller identity %q", refreshed.DeviceID, deviceID)
+	}
+}
+
 func TestInteractiveFlowResumesAuthenticatedSessionAndRefreshesCookies(t *testing.T) {
 	server := newInteractiveTestServer(t, interactiveScenario{alreadyLoggedIn: true})
 	defer server.Close()
