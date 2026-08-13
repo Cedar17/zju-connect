@@ -178,7 +178,7 @@ func newL3TunnelConn(ctx context.Context, dialTLS func(context.Context, string, 
 	signKey, err := hex.DecodeString(signKeyHex)
 	if err != nil {
 		_ = tlsConn.Close()
-		return nil, fmt.Errorf("invalid sign key: %w", err)
+		return nil, fmt.Errorf("%w: invalid sign key", errL3TunnelConfiguration)
 	}
 
 	c := &l3TunnelConn{
@@ -911,7 +911,7 @@ func logFrame(prefix string, data []byte) {
 func (c *l3TunnelConn) authTunnel() error {
 	req, err := json.Marshal(authRequestSID{Sid: c.info.sid})
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: encode tunnel authentication", errL3TunnelConfiguration)
 	}
 
 	packet := wrapAuthReqData(req, 1)
@@ -926,7 +926,7 @@ func (c *l3TunnelConn) authTunnel() error {
 	log.DebugPrintf("l3-tunnel recv tunnel auth method len=%d", len(method))
 	log.DebugDumpHex(method)
 	if method[0] != l3Version || method[1] != 0xD0 {
-		return fmt.Errorf("l3-tunnel unexpected auth method resp: %02x %02x", method[0], method[1])
+		return fmt.Errorf("%w: unexpected tunnel authentication method", errL3TunnelConfiguration)
 	}
 
 	header := make([]byte, 4)
@@ -936,7 +936,7 @@ func (c *l3TunnelConn) authTunnel() error {
 	log.DebugPrintf("l3-tunnel recv tunnel auth header len=%d", len(header))
 	log.DebugDumpHex(header)
 	if header[0] != 0x53 {
-		return fmt.Errorf("l3-tunnel unexpected auth resp version: 0x%02x", header[0])
+		return fmt.Errorf("%w: unexpected tunnel authentication response", errL3TunnelConfiguration)
 	}
 	status := header[1]
 	length := int(binary.BigEndian.Uint16(header[2:4]))
@@ -949,15 +949,15 @@ func (c *l3TunnelConn) authTunnel() error {
 	log.DebugPrintf("l3-tunnel recv tunnel auth payload len=%d status=%d", len(payload), status)
 	log.DebugDumpHex(payload)
 	if status != 0 {
-		return fmt.Errorf("l3-tunnel tunnel auth status %d", status)
+		return fmt.Errorf("%w: tunnel authentication status %d", errL3TunnelAuthentication, status)
 	}
 	if len(payload) > 0 {
 		var resp authResponseSID
 		if err := json.Unmarshal(payload, &resp); err != nil {
-			return err
+			return fmt.Errorf("%w: invalid tunnel authentication response", errL3TunnelConfiguration)
 		}
 		if resp.Code != 0 {
-			return fmt.Errorf("l3-tunnel tunnel auth failed: %d %s", resp.Code, resp.Message)
+			return fmt.Errorf("%w: tunnel authentication code %d", errL3TunnelAuthentication, resp.Code)
 		}
 	}
 
@@ -969,7 +969,7 @@ func (c *l3TunnelConn) authTunnel() error {
 	log.DebugDumpHex(vipHeader)
 	dataLen, err := parseInitialVIPHeader(vipHeader)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: invalid tunnel address response", errL3TunnelConfiguration)
 	}
 	vipData := make([]byte, dataLen)
 	if _, err := io.ReadFull(c.reader, vipData); err != nil {

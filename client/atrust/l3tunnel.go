@@ -20,12 +20,18 @@ type L3Tunnel struct {
 
 	resourceIndex *ipresource.Index
 
-	conns             map[string]*l3TunnelConn
-	connsMu           sync.Mutex
-	connecting        map[string]*l3TunnelConnectCall
-	connect           func(context.Context, string) (*l3TunnelConn, error)
-	reconnectDelay    time.Duration
-	reconnectAttempts int
+	conns            map[string]*l3TunnelConn
+	connsMu          sync.Mutex
+	recoveries       map[string]*l3TunnelRecovery
+	failedGroups     map[string]error
+	connect          func(context.Context, string) (*l3TunnelConn, error)
+	reconnectBackoff []time.Duration
+	reconnectDemand  time.Duration
+
+	eventsMu         sync.Mutex
+	eventSubscribers map[*L3Conn]chan L3TunnelEvent
+	recoveringGroups map[string]struct{}
+	terminalFailure  L3TunnelFailure
 
 	vipMu   sync.Mutex
 	vipList []net.IP
@@ -35,26 +41,32 @@ type L3Tunnel struct {
 	closeOnce sync.Once
 }
 
-type l3TunnelConnectCall struct {
-	done chan struct{}
-	conn *l3TunnelConn
-	err  error
+var defaultReconnectBackoff = []time.Duration{
+	time.Second,
+	2 * time.Second,
+	4 * time.Second,
+	8 * time.Second,
+	16 * time.Second,
+	30 * time.Second,
+	time.Minute,
+	2 * time.Minute,
+	5 * time.Minute,
 }
 
-const (
-	defaultReconnectDelay    = time.Second
-	defaultReconnectAttempts = 5
-)
+const defaultReconnectDemandInterval = 5 * time.Second
 
 func NewL3Tunnel(aTrustClient *Client) (*L3Tunnel, error) {
 	t := &L3Tunnel{
-		client:            aTrustClient,
-		conns:             make(map[string]*l3TunnelConn),
-		connecting:        make(map[string]*l3TunnelConnectCall),
-		reconnectDelay:    defaultReconnectDelay,
-		reconnectAttempts: defaultReconnectAttempts,
-		dataChan:          make(chan []byte, 4096),
-		closeCh:           make(chan struct{}),
+		client:           aTrustClient,
+		conns:            make(map[string]*l3TunnelConn),
+		recoveries:       make(map[string]*l3TunnelRecovery),
+		failedGroups:     make(map[string]error),
+		reconnectBackoff: append([]time.Duration(nil), defaultReconnectBackoff...),
+		reconnectDemand:  defaultReconnectDemandInterval,
+		eventSubscribers: make(map[*L3Conn]chan L3TunnelEvent),
+		recoveringGroups: make(map[string]struct{}),
+		dataChan:         make(chan []byte, 4096),
+		closeCh:          make(chan struct{}),
 	}
 	t.connect = func(ctx context.Context, addr string) (*l3TunnelConn, error) {
 		info := clientInfo{
@@ -131,6 +143,7 @@ func (t *L3Tunnel) Close() {
 		for _, conn := range conns {
 			_ = conn.Close()
 		}
+		t.closeEventSubscribers()
 	})
 }
 
@@ -142,31 +155,22 @@ func (t *L3Tunnel) getConn(nodeGroupID string) (*l3TunnelConn, error) {
 	}
 
 	t.connsMu.Lock()
-	if conn := t.conns[nodeGroupID]; conn != nil {
-		t.connsMu.Unlock()
+	conn := t.conns[nodeGroupID]
+	failure := t.failedGroups[nodeGroupID]
+	recovery := t.recoveries[nodeGroupID]
+	t.connsMu.Unlock()
+	if conn != nil {
 		return conn, nil
 	}
-	if call := t.connecting[nodeGroupID]; call != nil {
-		t.connsMu.Unlock()
-		return t.waitConnectCall(call)
+	if failure != nil {
+		return nil, failure
 	}
-	call := &l3TunnelConnectCall{done: make(chan struct{})}
-	if t.connecting == nil {
-		t.connecting = make(map[string]*l3TunnelConnectCall)
+	if recovery == nil {
+		t.startRecovery(nodeGroupID, false)
+	} else {
+		t.nudgeRecovery(recovery)
 	}
-	t.connecting[nodeGroupID] = call
-	t.connsMu.Unlock()
-	go t.connectWithRetry(nodeGroupID, call, true)
-	return t.waitConnectCall(call)
-}
-
-func (t *L3Tunnel) waitConnectCall(call *l3TunnelConnectCall) (*l3TunnelConn, error) {
-	select {
-	case <-call.done:
-		return call.conn, call.err
-	case <-t.closeCh:
-		return nil, net.ErrClosed
-	}
+	return nil, ErrL3TunnelRecovering
 }
 
 func (t *L3Tunnel) connectConn(nodeGroupID string) (*l3TunnelConn, error) {
@@ -177,7 +181,7 @@ func (t *L3Tunnel) connectConn(nodeGroupID string) (*l3TunnelConn, error) {
 	}
 	t.client.BestNodesRWMutex.RUnlock()
 	if addr == "" {
-		return nil, fmt.Errorf("no available node for group %s", nodeGroupID)
+		return nil, fmt.Errorf("%w: no available node for group %s", errL3TunnelConfiguration, nodeGroupID)
 	}
 
 	ctx, cancel := context.WithTimeout(t.client.lifecycleCtx, 10*time.Second)
@@ -239,94 +243,5 @@ func (t *L3Tunnel) forwardFromConn(nodeGroupID string, conn *l3TunnelConn) {
 }
 
 func (t *L3Tunnel) startReconnect(nodeGroupID string) {
-	if t.client == nil || t.connect == nil {
-		return
-	}
-	select {
-	case <-t.closeCh:
-		return
-	default:
-	}
-	t.connsMu.Lock()
-	if t.conns[nodeGroupID] != nil || t.connecting[nodeGroupID] != nil {
-		t.connsMu.Unlock()
-		return
-	}
-	if t.connecting == nil {
-		t.connecting = make(map[string]*l3TunnelConnectCall)
-	}
-	call := &l3TunnelConnectCall{done: make(chan struct{})}
-	t.connecting[nodeGroupID] = call
-	t.connsMu.Unlock()
-	go t.connectWithRetry(nodeGroupID, call, false)
-}
-
-func (t *L3Tunnel) connectWithRetry(nodeGroupID string, call *l3TunnelConnectCall, immediate bool) {
-	delay := t.reconnectDelay
-	if delay <= 0 {
-		delay = defaultReconnectDelay
-	}
-	attempts := t.reconnectAttempts
-	if attempts <= 0 {
-		attempts = defaultReconnectAttempts
-	}
-	var conn *l3TunnelConn
-	var err error
-	for attempt := 0; attempt < attempts; attempt++ {
-		if !immediate || attempt > 0 {
-			backoffAttempt := attempt
-			if immediate {
-				backoffAttempt--
-			}
-			timer := time.NewTimer(delay << backoffAttempt)
-			select {
-			case <-timer.C:
-			case <-t.closeCh:
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
-				t.finishConnect(nodeGroupID, call, nil, net.ErrClosed)
-				return
-			}
-		}
-		conn, err = t.connectConn(nodeGroupID)
-		if err == nil {
-			t.finishConnect(nodeGroupID, call, conn, nil)
-			return
-		}
-		log.DebugPrintf("l3-tunnel connect attempt %d/%d failed for group %s: %v", attempt+1, attempts, nodeGroupID, err)
-	}
-	t.finishConnect(nodeGroupID, call, nil, err)
-}
-
-func (t *L3Tunnel) finishConnect(nodeGroupID string, call *l3TunnelConnectCall, conn *l3TunnelConn, err error) {
-	t.connsMu.Lock()
-	if t.connecting[nodeGroupID] != call {
-		t.connsMu.Unlock()
-		if conn != nil {
-			_ = conn.Close()
-		}
-		return
-	}
-	delete(t.connecting, nodeGroupID)
-	if err == nil {
-		select {
-		case <-t.closeCh:
-			err = net.ErrClosed
-		default:
-			t.conns[nodeGroupID] = conn
-		}
-	}
-	call.conn = conn
-	call.err = err
-	close(call.done)
-	t.connsMu.Unlock()
-	if err != nil && conn != nil {
-		_ = conn.Close()
-	} else if err == nil {
-		go t.forwardFromConn(nodeGroupID, conn)
-	}
+	t.startRecovery(nodeGroupID, true)
 }

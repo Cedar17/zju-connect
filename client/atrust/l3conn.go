@@ -9,6 +9,7 @@ import (
 type L3Conn struct {
 	l3Tunnel    *L3Tunnel
 	writePacket func([]byte) error
+	events      chan L3TunnelEvent
 	recvLock    sync.Mutex
 	closeCh     chan struct{}
 	closeOnce   sync.Once
@@ -51,8 +52,19 @@ func (c *L3Conn) Write(p []byte) (n int, err error) {
 }
 
 func (c *L3Conn) Close() error {
-	c.closeOnce.Do(func() { close(c.closeCh) })
+	c.closeOnce.Do(func() {
+		close(c.closeCh)
+		if c.l3Tunnel != nil && c.events != nil {
+			c.l3Tunnel.unsubscribeEvents(c)
+		}
+	})
 	return nil
+}
+
+// Events reports recoverable L3 lifecycle transitions. The channel closes when
+// either this connection or its parent tunnel closes.
+func (c *L3Conn) Events() <-chan L3TunnelEvent {
+	return c.events
 }
 
 func (t *L3Tunnel) NewL3Conn() (io.ReadWriteCloser, error) {
@@ -60,6 +72,7 @@ func (t *L3Tunnel) NewL3Conn() (io.ReadWriteCloser, error) {
 		l3Tunnel: t,
 		closeCh:  make(chan struct{}),
 	}
+	conn.events = t.subscribeEvents(conn)
 
 	return conn, nil
 }

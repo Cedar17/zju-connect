@@ -13,6 +13,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -21,6 +22,33 @@ import (
 	"github.com/mythologyli/zju-connect/internal/zctcpip"
 	zlog "github.com/mythologyli/zju-connect/log"
 )
+
+func waitForTunnelConn(t *testing.T, tunnel *L3Tunnel, group string, want *l3TunnelConn) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		tunnel.connsMu.Lock()
+		got := tunnel.conns[group]
+		tunnel.connsMu.Unlock()
+		if got == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("tunnel connection did not become active")
+}
+
+func wantL3Event(t *testing.T, events <-chan L3TunnelEvent, state L3TunnelState, failure L3TunnelFailure) {
+	t.Helper()
+	select {
+	case event := <-events:
+		if event.State != state || event.Failure != failure {
+			t.Fatalf("L3 event = %+v, want state=%s failure=%s", event, state, failure)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for L3 event state=%s", state)
+	}
+}
 
 func TestForwardFromConnPreservesPacket(t *testing.T) {
 	transport := &trackingNetConn{closed: make(chan struct{})}
@@ -63,11 +91,12 @@ func TestGetConnCoalescesConcurrentConnects(t *testing.T) {
 	client := NewClient("user", "sid", "device", "")
 	client.BestNodes = map[string]string{"group": "node:443"}
 	tunnel := &L3Tunnel{
-		client:     client,
-		conns:      make(map[string]*l3TunnelConn),
-		connecting: make(map[string]*l3TunnelConnectCall),
-		dataChan:   make(chan []byte, 1),
-		closeCh:    make(chan struct{}),
+		client:       client,
+		conns:        make(map[string]*l3TunnelConn),
+		recoveries:   make(map[string]*l3TunnelRecovery),
+		failedGroups: make(map[string]error),
+		dataChan:     make(chan []byte, 1),
+		closeCh:      make(chan struct{}),
 	}
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -88,12 +117,10 @@ func TestGetConnCoalescesConcurrentConnects(t *testing.T) {
 	}
 
 	const callers = 16
-	results := make(chan *l3TunnelConn, callers)
 	errs := make(chan error, callers)
 	for range callers {
 		go func() {
-			conn, err := tunnel.getConn("group")
-			results <- conn
+			_, err := tunnel.getConn("group")
 			errs <- err
 		}()
 	}
@@ -102,13 +129,11 @@ func TestGetConnCoalescesConcurrentConnects(t *testing.T) {
 	close(release)
 
 	for range callers {
-		if err := <-errs; err != nil {
-			t.Fatalf("getConn() error = %v", err)
-		}
-		if got := <-results; got != want {
-			t.Fatalf("getConn() = %p, want %p", got, want)
+		if err := <-errs; !errors.Is(err, ErrL3TunnelRecovering) {
+			t.Fatalf("getConn() error = %v, want ErrL3TunnelRecovering", err)
 		}
 	}
+	waitForTunnelConn(t, tunnel, "group", want)
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("connect calls = %d, want 1", got)
 	}
@@ -139,17 +164,18 @@ func TestTunnelAuthUsesContextDeadline(t *testing.T) {
 	}
 }
 
-func TestTunnelReconnectUsesBackoffAndSharesResult(t *testing.T) {
+func TestTunnelReconnectUsesBackoffAndPublishesActive(t *testing.T) {
 	client := NewClient("user", "sid", "device", "")
 	client.BestNodes = map[string]string{"group": "node:443"}
 	tunnel := &L3Tunnel{
-		client:            client,
-		conns:             make(map[string]*l3TunnelConn),
-		connecting:        make(map[string]*l3TunnelConnectCall),
-		dataChan:          make(chan []byte, 1),
-		closeCh:           make(chan struct{}),
-		reconnectDelay:    10 * time.Millisecond,
-		reconnectAttempts: 3,
+		client:           client,
+		conns:            make(map[string]*l3TunnelConn),
+		recoveries:       make(map[string]*l3TunnelRecovery),
+		failedGroups:     make(map[string]error),
+		dataChan:         make(chan []byte, 1),
+		closeCh:          make(chan struct{}),
+		reconnectBackoff: []time.Duration{10 * time.Millisecond},
+		reconnectDemand:  time.Millisecond,
 	}
 	transport := &trackingNetConn{closed: make(chan struct{})}
 	want := &l3TunnelConn{
@@ -172,18 +198,19 @@ func TestTunnelReconnectUsesBackoffAndSharesResult(t *testing.T) {
 		}
 	}
 
-	tunnel.startReconnect("group")
-	got, err := tunnel.getConn("group")
+	eventsConn, err := tunnel.NewL3Conn()
 	if err != nil {
-		t.Fatalf("getConn() error = %v", err)
+		t.Fatalf("NewL3Conn() error = %v", err)
 	}
-	if got != want {
-		t.Fatalf("getConn() = %p, want %p", got, want)
-	}
+	events := eventsConn.(*L3Conn).Events()
+	tunnel.startReconnect("group")
+	wantL3Event(t, events, L3TunnelStateRecovering, "")
+	wantL3Event(t, events, L3TunnelStateActive, "")
+	waitForTunnelConn(t, tunnel, "group", want)
 	if calls.Load() != 2 {
 		t.Fatalf("connect calls = %d, want 2", calls.Load())
 	}
-	if elapsed := secondAttempt.Sub(firstAttempt); elapsed < 15*time.Millisecond {
+	if elapsed := secondAttempt.Sub(firstAttempt); elapsed < 8*time.Millisecond {
 		t.Fatalf("retry delay = %s, want exponential backoff", elapsed)
 	}
 	tunnel.Close()
@@ -193,13 +220,12 @@ func TestReconnectDoesNotRaceForegroundConnect(t *testing.T) {
 	client := NewClient("user", "sid", "device", "")
 	client.BestNodes = map[string]string{"group": "node:443"}
 	tunnel := &L3Tunnel{
-		client:            client,
-		conns:             make(map[string]*l3TunnelConn),
-		connecting:        make(map[string]*l3TunnelConnectCall),
-		dataChan:          make(chan []byte, 1),
-		closeCh:           make(chan struct{}),
-		reconnectDelay:    time.Millisecond,
-		reconnectAttempts: 1,
+		client:       client,
+		conns:        make(map[string]*l3TunnelConn),
+		recoveries:   make(map[string]*l3TunnelRecovery),
+		failedGroups: make(map[string]error),
+		dataChan:     make(chan []byte, 1),
+		closeCh:      make(chan struct{}),
 	}
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -218,21 +244,199 @@ func TestReconnectDoesNotRaceForegroundConnect(t *testing.T) {
 		return want, nil
 	}
 
-	result := make(chan *l3TunnelConn, 1)
-	go func() {
-		conn, _ := tunnel.getConn("group")
-		result <- conn
-	}()
+	if _, err := tunnel.getConn("group"); !errors.Is(err, ErrL3TunnelRecovering) {
+		t.Fatalf("getConn() error = %v, want ErrL3TunnelRecovering", err)
+	}
 	<-started
 	tunnel.startReconnect("group")
 	close(release)
-	if got := <-result; got != want {
-		t.Fatalf("getConn() = %p, want %p", got, want)
-	}
+	waitForTunnelConn(t, tunnel, "group", want)
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("connect calls = %d, want 1", got)
 	}
 	tunnel.Close()
+}
+
+func TestTunnelRecoveryContinuesPastBackoffSchedule(t *testing.T) {
+	client := NewClient("user", "sid", "device", "")
+	client.BestNodes = map[string]string{"group": "node:443"}
+	tunnel := &L3Tunnel{
+		client:           client,
+		conns:            make(map[string]*l3TunnelConn),
+		recoveries:       make(map[string]*l3TunnelRecovery),
+		failedGroups:     make(map[string]error),
+		dataChan:         make(chan []byte, 1),
+		closeCh:          make(chan struct{}),
+		reconnectBackoff: []time.Duration{time.Millisecond, 2 * time.Millisecond},
+		reconnectDemand:  time.Millisecond,
+	}
+	want := &l3TunnelConn{
+		tlsConn:      tls.Client(&trackingNetConn{closed: make(chan struct{})}, &tls.Config{InsecureSkipVerify: true}),
+		incoming:     make(chan []byte),
+		closeCh:      make(chan struct{}),
+		conntrackMgr: newConntrackMgr(),
+	}
+	var calls atomic.Int32
+	tunnel.connect = func(context.Context, string) (*l3TunnelConn, error) {
+		if calls.Add(1) < 5 {
+			return nil, fmt.Errorf("dial failed: %w", net.ErrClosed)
+		}
+		return want, nil
+	}
+	eventsConn, _ := tunnel.NewL3Conn()
+	events := eventsConn.(*L3Conn).Events()
+
+	tunnel.startReconnect("group")
+	wantL3Event(t, events, L3TunnelStateRecovering, "")
+	wantL3Event(t, events, L3TunnelStateActive, "")
+	waitForTunnelConn(t, tunnel, "group", want)
+	if got := calls.Load(); got != 5 {
+		t.Fatalf("connect calls = %d, want 5", got)
+	}
+	tunnel.Close()
+}
+
+func TestTunnelRecoveryDemandNudgeIsRateLimited(t *testing.T) {
+	client := NewClient("user", "sid", "device", "")
+	client.BestNodes = map[string]string{"group": "node:443"}
+	tunnel := &L3Tunnel{
+		client:           client,
+		conns:            make(map[string]*l3TunnelConn),
+		recoveries:       make(map[string]*l3TunnelRecovery),
+		failedGroups:     make(map[string]error),
+		dataChan:         make(chan []byte, 1),
+		closeCh:          make(chan struct{}),
+		reconnectBackoff: []time.Duration{200 * time.Millisecond},
+		reconnectDemand:  20 * time.Millisecond,
+	}
+	want := &l3TunnelConn{
+		tlsConn:      tls.Client(&trackingNetConn{closed: make(chan struct{})}, &tls.Config{InsecureSkipVerify: true}),
+		incoming:     make(chan []byte),
+		closeCh:      make(chan struct{}),
+		conntrackMgr: newConntrackMgr(),
+	}
+	attempts := make(chan time.Time, 2)
+	var calls atomic.Int32
+	tunnel.connect = func(context.Context, string) (*l3TunnelConn, error) {
+		attempts <- time.Now()
+		if calls.Add(1) == 1 {
+			return nil, fmt.Errorf("dial failed: %w", net.ErrClosed)
+		}
+		return want, nil
+	}
+
+	tunnel.startReconnect("group")
+	first := <-attempts
+	for range 16 {
+		_, _ = tunnel.getConn("group")
+	}
+	second := <-attempts
+	elapsed := second.Sub(first)
+	if elapsed < 15*time.Millisecond {
+		t.Fatalf("demand retry interval = %s, want rate limit", elapsed)
+	}
+	if elapsed >= 150*time.Millisecond {
+		t.Fatalf("demand retry interval = %s, want backoff preemption", elapsed)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("connect calls = %d, want 2", got)
+	}
+	tunnel.Close()
+}
+
+func TestTunnelPermanentFailurePublishesSafeCategory(t *testing.T) {
+	client := NewClient("user", "sid", "device", "")
+	client.BestNodes = map[string]string{"group": "node:443"}
+	tunnel := &L3Tunnel{
+		client:       client,
+		conns:        make(map[string]*l3TunnelConn),
+		recoveries:   make(map[string]*l3TunnelRecovery),
+		failedGroups: make(map[string]error),
+		dataChan:     make(chan []byte, 1),
+		closeCh:      make(chan struct{}),
+	}
+	tunnel.connect = func(context.Context, string) (*l3TunnelConn, error) {
+		return nil, fmt.Errorf("%w: rejected", errL3TunnelAuthentication)
+	}
+	eventsConn, _ := tunnel.NewL3Conn()
+	events := eventsConn.(*L3Conn).Events()
+
+	tunnel.startReconnect("group")
+	wantL3Event(t, events, L3TunnelStateRecovering, "")
+	wantL3Event(t, events, L3TunnelStateFailed, L3TunnelFailureAuthentication)
+	if _, err := tunnel.getConn("group"); err == nil || errors.Is(err, ErrL3TunnelRecovering) {
+		t.Fatalf("getConn() error = %v, want permanent failure", err)
+	}
+	tunnel.Close()
+}
+
+func TestTunnelEventsAggregateRecoveringGroups(t *testing.T) {
+	tunnel := &L3Tunnel{
+		closeCh:          make(chan struct{}),
+		eventSubscribers: make(map[*L3Conn]chan L3TunnelEvent),
+		recoveringGroups: make(map[string]struct{}),
+	}
+	eventsConn, _ := tunnel.NewL3Conn()
+	events := eventsConn.(*L3Conn).Events()
+
+	tunnel.markGroupRecovering("first")
+	wantL3Event(t, events, L3TunnelStateRecovering, "")
+	tunnel.markGroupRecovering("second")
+	tunnel.markGroupActive("first")
+	select {
+	case event := <-events:
+		t.Fatalf("unexpected intermediate event: %+v", event)
+	default:
+	}
+	tunnel.markGroupActive("second")
+	wantL3Event(t, events, L3TunnelStateActive, "")
+	tunnel.Close()
+}
+
+func TestTunnelCloseCancelsRecoveryBackoff(t *testing.T) {
+	client := NewClient("user", "sid", "device", "")
+	client.BestNodes = map[string]string{"group": "node:443"}
+	tunnel := &L3Tunnel{
+		client:           client,
+		conns:            make(map[string]*l3TunnelConn),
+		recoveries:       make(map[string]*l3TunnelRecovery),
+		failedGroups:     make(map[string]error),
+		dataChan:         make(chan []byte, 1),
+		closeCh:          make(chan struct{}),
+		reconnectBackoff: []time.Duration{time.Hour},
+	}
+	called := make(chan struct{}, 2)
+	tunnel.connect = func(context.Context, string) (*l3TunnelConn, error) {
+		called <- struct{}{}
+		return nil, fmt.Errorf("dial failed: %w", net.ErrClosed)
+	}
+	eventsConn, _ := tunnel.NewL3Conn()
+	events := eventsConn.(*L3Conn).Events()
+	tunnel.startReconnect("group")
+	<-called
+	wantL3Event(t, events, L3TunnelStateRecovering, "")
+	tunnel.Close()
+	select {
+	case <-called:
+		t.Fatal("recovery attempted another connection after close")
+	case <-time.After(20 * time.Millisecond):
+	}
+	if _, ok := <-events; ok {
+		t.Fatal("event channel remained open after tunnel close")
+	}
+}
+
+func TestNetworkWriteErrorIsRecoverable(t *testing.T) {
+	err := &net.OpError{Op: "write", Net: "tcp", Err: errors.New("broken pipe")}
+	if !isRecoverableL3TransportError(err) {
+		t.Fatal("network write error was not classified as recoverable")
+	}
+	if !isRecoverableL3TransportError(syscall.EPIPE) {
+		t.Fatal("broken pipe was not classified as recoverable")
+	}
+	if isRecoverableL3TransportError(errors.New("authentication denied")) {
+		t.Fatal("authentication error was classified as recoverable transport failure")
+	}
 }
 
 func TestForwardFromConnStopsWhenTunnelClosesWithFullQueue(t *testing.T) {
