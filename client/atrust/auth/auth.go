@@ -404,11 +404,14 @@ func (s *Session) Login(method LoginMethod, opts LoginOptions) (LoginResult, err
 	if isLogin == 1 {
 		log.Println("Already logged in")
 		username, err := s.onlineInfo()
+		if err != nil {
+			return LoginResult{}, err
+		}
 		return LoginResult{
 			Username: username,
-			SID:      sid,
-			Cookies:  opts.Cookies,
-		}, err
+			SID:      sessionSID(s),
+			Cookies:  sessionCookies(s),
+		}, nil
 	}
 
 	if method == nil {
@@ -466,4 +469,28 @@ func (s *Session) Login(method LoginMethod, opts LoginOptions) (LoginResult, err
 		SID:      sid,
 		Cookies:  cookies,
 	}, nil
+}
+
+func sessionCookies(session *Session) []Cookie {
+	endpoint := &url.URL{Host: session.baseHost, Scheme: "https"}
+	cookies := session.client.Jar.Cookies(endpoint)
+	result := make([]Cookie, 0, len(cookies))
+	for _, cookie := range cookies {
+		result = append(result, Cookie{
+			Host:   session.baseHost,
+			Scheme: "https",
+			Name:   cookie.Name,
+			Value:  cookie.Value,
+		})
+	}
+	return result
+}
+
+func sessionSID(session *Session) string {
+	for _, cookie := range sessionCookies(session) {
+		if cookie.Name == "sid" {
+			return cookie.Value
+		}
+	}
+	return ""
 }

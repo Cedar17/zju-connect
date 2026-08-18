@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"net/url"
 	"sync"
 	"sync/atomic"
 )
@@ -76,7 +75,6 @@ type InteractiveFlow struct {
 	mu sync.Mutex
 
 	session        *Session
-	newSession     func() *Session
 	deviceID       string
 	deviceIDLocked bool
 	state          interactiveState
@@ -133,10 +131,8 @@ func newInteractiveFlow(server, deviceID string, locked, strictTLS bool, dialCon
 	if !strictTLS {
 		tlsConfig = &tls.Config{InsecureSkipVerify: true} // #nosec G402 -- opt-in compatibility for non-Android callers.
 	}
-	newSession := func() *Session { return newSession(server, tlsConfig, dialContext...) }
 	return &InteractiveFlow{
-		session:        newSession(),
-		newSession:     newSession,
+		session:        newSession(server, tlsConfig, dialContext...),
 		deviceID:       deviceID,
 		deviceIDLocked: locked,
 		state:          interactiveNew,
@@ -223,9 +219,13 @@ func (f *InteractiveFlow) Resume(authData []byte) (InteractivePrompt, error) {
 	})
 	if err != nil {
 		if errors.Is(err, ErrSessionInvalid) {
-			f.session.cancel()
-			f.session = f.newSession()
-			f.state = interactiveNew
+			// A rejected SID is not evidence that the authenticated client
+			// context is useless. Session.Login has already restored the
+			// persisted cookies into this Session's jar, and the server may use
+			// them together with the stable device identity during password
+			// reauthentication. Keep that context until an explicit cancellation
+			// or account switch instead of replacing it with a blank Session.
+			f.resetForReauthentication()
 			return f.begin("sessionExpired")
 		}
 		return InteractivePrompt{}, err
@@ -631,29 +631,27 @@ func (f *InteractiveFlow) complete() (InteractivePrompt, error) {
 	return InteractivePrompt{State: string(f.state), Message: "Authentication completed"}, nil
 }
 
-func sessionCookies(session *Session) []Cookie {
-	endpoint := &url.URL{Host: session.baseHost, Scheme: "https"}
-	cookies := session.client.Jar.Cookies(endpoint)
-	result := make([]Cookie, 0, len(cookies))
-	for _, cookie := range cookies {
-		result = append(result, Cookie{Host: session.baseHost, Scheme: "https", Name: cookie.Name, Value: cookie.Value})
-	}
-	return result
-}
-
-func sessionSID(session *Session) string {
-	for _, cookie := range sessionCookies(session) {
-		if cookie.Name == "sid" {
-			return cookie.Value
-		}
-	}
-	return ""
-}
-
 func (f *InteractiveFlow) clearCredentials() {
 	f.username = ""
 	f.password = ""
 	f.smsCode = ""
+}
+
+// resetForReauthentication clears only ephemeral interactive input while
+// preserving the Session, its cookie jar, and the caller-owned device ID.
+// It is used after a restored SID expires, before the caller selects a fresh
+// server-advertised authentication method.
+func (f *InteractiveFlow) resetForReauthentication() {
+	f.clearCredentials()
+	f.phone = ""
+	f.captcha = nil
+	f.purpose = 0
+	f.pendingStep = authStep{}
+	f.primarySMS = false
+	f.methods = nil
+	f.selected = nil
+	f.result = nil
+	f.state = interactiveNew
 }
 
 func (f *InteractiveFlow) clearSensitiveState() {

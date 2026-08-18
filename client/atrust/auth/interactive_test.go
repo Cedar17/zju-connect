@@ -116,7 +116,10 @@ func TestInteractiveFlowPasswordCaptchaAndSecondarySMS(t *testing.T) {
 }
 
 func TestInteractiveFlowExpiredSessionReauthenticatesWithSecondarySMSOnly(t *testing.T) {
-	server := newInteractiveTestServer(t, interactiveScenario{secondarySMS: true})
+	server := newInteractiveTestServer(t, interactiveScenario{
+		secondarySMS:        true,
+		expectedPasswordSID: "expired-session-cookie",
+	})
 	defer server.Close()
 
 	host := strings.TrimPrefix(server.URL, "https://")
@@ -168,6 +171,29 @@ func TestInteractiveFlowExpiredSessionReauthenticatesWithSecondarySMSOnly(t *tes
 	}
 	if refreshed.DeviceID != deviceID {
 		t.Fatalf("device ID = %q, want stable caller identity %q", refreshed.DeviceID, deviceID)
+	}
+	if got := cookieValue(refreshed.Cookies, "sid"); got != "session-cookie" {
+		t.Fatalf("refreshed sid = %q, want session-cookie", got)
+	}
+}
+
+func TestSessionLoginReturnsCookiesFromRefreshedJar(t *testing.T) {
+	server := newInteractiveTestServer(t, interactiveScenario{alreadyLoggedIn: true})
+	defer server.Close()
+
+	host := strings.TrimPrefix(server.URL, "https://")
+	result, err := newTLSTestSession(server).Login(nil, LoginOptions{
+		DeviceID: "0123456789abcdef0123456789abcdef",
+		Cookies:  []Cookie{{Host: host, Scheme: "https", Name: "sid", Value: "stored-session-cookie"}},
+	})
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	if result.SID != "refreshed-session-cookie" {
+		t.Fatalf("SID = %q, want refreshed-session-cookie", result.SID)
+	}
+	if got := cookieValue(result.Cookies, "sid"); got != "refreshed-session-cookie" {
+		t.Fatalf("returned sid cookie = %q, want refreshed-session-cookie", got)
 	}
 }
 
@@ -411,14 +437,15 @@ func waitForInteractiveCancellation(t *testing.T, flow *InteractiveFlow) {
 }
 
 type interactiveScenario struct {
-	captcha          bool
-	secondarySMS     bool
-	secondaryService string
-	alreadyLoggedIn  bool
-	blockPassword    bool
-	rejectPassword   bool
-	passwordStarted  chan struct{}
-	passwordRelease  <-chan struct{}
+	captcha             bool
+	secondarySMS        bool
+	secondaryService    string
+	alreadyLoggedIn     bool
+	blockPassword       bool
+	rejectPassword      bool
+	expectedPasswordSID string
+	passwordStarted     chan struct{}
+	passwordRelease     <-chan struct{}
 }
 
 func newTrustedFlow(t *testing.T, server *httptest.Server) *InteractiveFlow {
@@ -437,8 +464,7 @@ func trustInteractiveFlow(t *testing.T, flow *InteractiveFlow, server *httptest.
 	host := strings.TrimPrefix(server.URL, "https://")
 	pool := x509.NewCertPool()
 	pool.AddCert(server.Certificate())
-	flow.newSession = func() *Session { return newSession(host, &tls.Config{RootCAs: pool}) }
-	flow.session = flow.newSession()
+	flow.session = newSession(host, &tls.Config{RootCAs: pool})
 }
 
 func newInteractiveTestServer(t *testing.T, scenario interactiveScenario) *httptest.Server {
@@ -483,6 +509,12 @@ func newInteractiveTestServer(t *testing.T, scenario interactiveScenario) *httpt
 				}},
 			}})
 		case "/passport/v1/auth/psw":
+			if scenario.expectedPasswordSID != "" {
+				cookie, err := request.Cookie("sid")
+				if err != nil || cookie.Value != scenario.expectedPasswordSID {
+					t.Errorf("password sid cookie = %#v, %v, want %q", cookie, err, scenario.expectedPasswordSID)
+				}
+			}
 			if scenario.blockPassword {
 				close(scenario.passwordStarted)
 				<-scenario.passwordRelease
