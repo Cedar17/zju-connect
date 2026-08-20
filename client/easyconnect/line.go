@@ -17,7 +17,7 @@ func findBestLine(lineList []string, dialContext func(context.Context, string, s
 	bestLine := ""
 	bestLatency := int64(0)
 
-	var pingList []ping.TCPing
+	var pingList []*ping.TCPing
 	var chList []<-chan struct{}
 
 	for _, server := range lineList {
@@ -40,7 +40,7 @@ func findBestLine(lineList []string, dialContext func(context.Context, string, s
 		}
 		tcping.SetTarget(&target)
 
-		pingList = append(pingList, *tcping)
+		pingList = append(pingList, tcping)
 		ch := tcping.Start()
 		chList = append(chList, ch)
 	}

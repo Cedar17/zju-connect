@@ -26,6 +26,38 @@ func getBestNodes(nodeGroups map[string]NodeGroup, dialContext func(context.Cont
 	})
 }
 
+func getBestNodesContext(ctx context.Context, nodeGroups map[string]NodeGroup, dialContext func(context.Context, string, string) (net.Conn, error)) (map[string]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	wanNodeGroups := make(map[string][]string, len(nodeGroups))
+	for group, nodes := range nodeGroups {
+		wanNodeGroups[group] = nodes.WAN
+	}
+	bestNodes, err := getBestReachableNodesContext(ctx, wanNodeGroups, dialContext)
+	if err != nil {
+		return nil, err
+	}
+
+	fallbackNodeGroups := make(map[string][]string)
+	for group, nodes := range nodeGroups {
+		if bestNodes[group] == "" && len(nodes.LAN) > 0 {
+			fallbackNodeGroups[group] = nodes.LAN
+		}
+	}
+	if len(fallbackNodeGroups) == 0 {
+		return bestNodes, nil
+	}
+	fallbackNodes, err := getBestReachableNodesContext(ctx, fallbackNodeGroups, dialContext)
+	if err != nil {
+		return nil, err
+	}
+	for group, node := range fallbackNodes {
+		bestNodes[group] = node
+	}
+	return bestNodes, nil
+}
+
 func selectBestNodes(nodeGroups map[string]NodeGroup, probe nodeGroupsProbeFunc) map[string]string {
 	wanNodeGroups := make(map[string][]string, len(nodeGroups))
 	for group, nodes := range nodeGroups {
@@ -50,11 +82,26 @@ func selectBestNodes(nodeGroups map[string]NodeGroup, probe nodeGroupsProbeFunc)
 }
 
 func getBestReachableNodes(nodeGroups map[string][]string, dialContext func(context.Context, string, string) (net.Conn, error)) map[string]string {
+	bestNodes, _ := getBestReachableNodesContext(context.Background(), nodeGroups, dialContext)
+	return bestNodes
+}
+
+func getBestReachableNodesContext(ctx context.Context, nodeGroups map[string][]string, dialContext func(context.Context, string, string) (net.Conn, error)) (map[string]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	bestNodes := make(map[string]string)
 	for group, nodes := range nodeGroups {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if len(nodes) > 0 {
-			var pingList []ping.TCPing
-			var chList []<-chan struct{}
+			type nodeProbe struct {
+				node   string
+				tcping *ping.TCPing
+				done   <-chan struct{}
+			}
+			var probes []nodeProbe
 
 			for _, node := range nodes {
 				parts := strings.Split(node, ":")
@@ -76,22 +123,28 @@ func getBestReachableNodes(nodeGroups map[string][]string, dialContext func(cont
 				}
 				tcping.SetTarget(&target)
 
-				pingList = append(pingList, *tcping)
-				ch := tcping.Start()
-				chList = append(chList, ch)
+				probes = append(probes, nodeProbe{
+					node:   node,
+					tcping: tcping,
+					done:   tcping.StartContext(ctx),
+				})
 			}
 
-			for _, ch := range chList {
-				<-ch
+			for _, probe := range probes {
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-probe.done:
+				}
 			}
 
 			bestScore := time.Duration(0)
 			bestNode := ""
-			for i, tcping := range pingList {
-				result := tcping.Result()
+			for _, probe := range probes {
+				result := probe.tcping.Result()
 				score, reachable := nodeProbeScore(result)
 				if reachable && (bestScore == 0 || score < bestScore) {
-					bestNode = nodes[i]
+					bestNode = probe.node
 					bestScore = score
 				}
 			}
@@ -103,7 +156,7 @@ func getBestReachableNodes(nodeGroups map[string][]string, dialContext func(cont
 		}
 	}
 
-	return bestNodes
+	return bestNodes, nil
 }
 
 func nodeProbeScore(result *ping.Result) (time.Duration, bool) {
@@ -128,7 +181,14 @@ func (c *Client) updateBestNodes(ctx context.Context, updateBestNodesInterval in
 		case <-ticker.C:
 		}
 
-		bestNodes := getBestNodes(c.NodeGroups, c.underlayDialer.DialContext)
+		bestNodes, err := getBestNodesContext(ctx, c.NodeGroups, c.underlayDialer.DialContext)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("Failed to update best nodes: %v", err)
+			continue
+		}
 		c.BestNodesRWMutex.Lock()
 		c.BestNodes = bestNodes
 		c.BestNodesRWMutex.Unlock()

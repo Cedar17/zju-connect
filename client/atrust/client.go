@@ -59,12 +59,35 @@ type Client struct {
 	underlayDialer  *underlay.Dialer
 	nodeTLSMu       sync.RWMutex
 	nodeTLSConfig   *tls.Config
+	setupStageMu    sync.RWMutex
+	setupStage      func(string)
 
 	skipTCPTunnelWait bool
 }
 
 func (c *Client) SetSkipTCPTunnelWait(skip bool) {
 	c.skipTCPTunnelWait = skip
+}
+
+// SetSetupStageReporter receives the fixed, privacy-safe setup stages emitted
+// by SetupContext. A client is prepared by one caller at a time, so the
+// reporter is intentionally client-scoped rather than process-global.
+func (c *Client) SetSetupStageReporter(reporter func(string)) {
+	if c == nil {
+		return
+	}
+	c.setupStageMu.Lock()
+	c.setupStage = reporter
+	c.setupStageMu.Unlock()
+}
+
+func (c *Client) reportSetupStage(stage string) {
+	c.setupStageMu.RLock()
+	reporter := c.setupStage
+	c.setupStageMu.RUnlock()
+	if reporter != nil {
+		reporter(stage)
+	}
 }
 
 func NewClient(username, sid, deviceID, signKey string) *Client {
@@ -297,7 +320,32 @@ func SetTrusted(serverAddress string, serverPort int, authData []byte, trusted b
 	}
 }
 
+// Setup preserves the historical API. New callers that own a connection
+// attempt should use SetupContext so cancellation reaches every startup phase.
 func (c *Client) Setup(serverAddress string, serverPort int, username, password, phone, loginDomain, authType, graphCodeFile, casTicket, oauth2Code, totpSecret string, authData, resourceData []byte, updateBestNodesInterval int, bindInterface string, autoDetectInterface bool) ([]byte, error) {
+	return c.SetupContext(context.Background(), serverAddress, serverPort, username, password, phone, loginDomain, authType, graphCodeFile, casTicket, oauth2Code, totpSecret, authData, resourceData, updateBestNodesInterval, bindInterface, autoDetectInterface)
+}
+
+// SetupContext performs the aTrust startup sequence with a caller-owned
+// deadline. The client lifecycle remains a second cancellation source so
+// Close() also interrupts a setup that is still in progress.
+func (c *Client) SetupContext(ctx context.Context, serverAddress string, serverPort int, username, password, phone, loginDomain, authType, graphCodeFile, casTicket, oauth2Code, totpSecret string, authData, resourceData []byte, updateBestNodesInterval int, bindInterface string, autoDetectInterface bool) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	setupCtx, cancelSetup := context.WithCancel(ctx)
+	defer cancelSetup()
+	lifecycleCtx := c.lifecycleCtx
+	if lifecycleCtx == nil {
+		lifecycleCtx = context.Background()
+	}
+	stopLifecycleCancellation := context.AfterFunc(lifecycleCtx, cancelSetup)
+	defer stopLifecycleCancellation()
+
+	if err := setupCtx.Err(); err != nil {
+		return nil, err
+	}
+	c.reportSetupStage("prepare.resource")
 	c.serverAddress = serverAddress
 	serverHost := net.JoinHostPort(serverAddress, fmt.Sprint(serverPort))
 	c.underlayDialer = newUnderlayDialer(serverHost, bindInterface, autoDetectInterface)
@@ -340,7 +388,7 @@ func (c *Client) Setup(serverAddress string, serverPort int, username, password,
 		} else {
 			authServerHost = fmt.Sprintf("%s:%d", serverAddress, serverPort)
 		}
-		sess := auth.NewSession(authServerHost, c.underlayDialer.DialContext)
+		sess := auth.NewSessionContext(setupCtx, authServerHost, c.underlayDialer.DialContext)
 
 		var err error
 		var loginMethod auth.LoginMethod
@@ -399,6 +447,9 @@ func (c *Client) Setup(serverAddress string, serverPort int, username, password,
 		}
 	}
 
+	if err := setupCtx.Err(); err != nil {
+		return nil, err
+	}
 	err := c.parseResource(resourceData)
 	if err != nil {
 		return nil, err
@@ -406,19 +457,43 @@ func (c *Client) Setup(serverAddress string, serverPort int, username, password,
 
 	log.DebugPrintf("SID: %s, DeviceID: %s, ConnectionID: %s, SignKey: %s", c.SID, c.DeviceID, c.ConnectionID, c.SignKey)
 
-	c.BestNodes = getBestNodes(c.NodeGroups, c.underlayDialer.DialContext)
+	if err := setupCtx.Err(); err != nil {
+		return nil, err
+	}
+	c.reportSetupStage("prepare.nodeProbe")
+	c.BestNodes, err = getBestNodesContext(setupCtx, c.NodeGroups, c.underlayDialer.DialContext)
+	if err != nil {
+		return nil, err
+	}
 
-	err = c.getIP()
+	if err := setupCtx.Err(); err != nil {
+		return nil, err
+	}
+	c.reportSetupStage("prepare.ip")
+	err = c.getIPContext(setupCtx)
 	if err != nil {
 		return nil, err
 	}
 	c.underlayDialer.ExcludeIP(c.ip)
 
+	if err := setupCtx.Err(); err != nil {
+		return nil, err
+	}
+	c.reportSetupStage("prepare.l3")
 	l3Tunnel, err := NewL3Tunnel(c)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create L3 tunnel: %v", err)
 	}
+	if err := setupCtx.Err(); err != nil {
+		l3Tunnel.Close()
+		return nil, err
+	}
 	c.l3TunnelMu.Lock()
+	if err := setupCtx.Err(); err != nil {
+		c.l3TunnelMu.Unlock()
+		l3Tunnel.Close()
+		return nil, err
+	}
 	c.l3Tunnel = l3Tunnel
 	c.l3TunnelMu.Unlock()
 
@@ -426,6 +501,7 @@ func (c *Client) Setup(serverAddress string, serverPort int, username, password,
 		go c.updateBestNodes(c.lifecycleCtx, updateBestNodesInterval)
 	}
 
+	c.reportSetupStage("prepare.complete")
 	return authData, nil
 }
 

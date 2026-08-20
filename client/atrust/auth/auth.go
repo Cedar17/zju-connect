@@ -94,10 +94,24 @@ type Session struct {
 }
 
 func NewSession(server string, dialContext ...func(context.Context, string, string) (net.Conn, error)) *Session {
-	return newSession(server, nil, dialContext...)
+	return NewSessionContext(context.Background(), server, dialContext...)
+}
+
+// NewSessionContext creates a session whose network activity is bounded by ctx.
+// The original NewSession entry point intentionally remains available for
+// callers that do not need a caller-owned request lifetime.
+func NewSessionContext(ctx context.Context, server string, dialContext ...func(context.Context, string, string) (net.Conn, error)) *Session {
+	return newSessionContext(ctx, server, nil, dialContext...)
 }
 
 func newSession(server string, tlsConfig *tls.Config, dialContext ...func(context.Context, string, string) (net.Conn, error)) *Session {
+	return newSessionContext(context.Background(), server, tlsConfig, dialContext...)
+}
+
+func newSessionContext(ctx context.Context, server string, tlsConfig *tls.Config, dialContext ...func(context.Context, string, string) (net.Conn, error)) *Session {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// Leave TLS verification enabled. The Android client must reject an
 	// untrusted certificate or a hostname mismatch before credentials are sent.
 	baseDialContext := (&net.Dialer{}).DialContext
@@ -111,7 +125,14 @@ func newSession(server string, tlsConfig *tls.Config, dialContext ...func(contex
 	}
 	jar, _ := cookiejar.New(nil)
 	client := &http.Client{Transport: tr, Jar: jar, Timeout: 20 * time.Second}
-	requestContext, cancelRequests := context.WithCancel(context.Background())
+	requestContext, cancelRequests := context.WithCancel(ctx)
+	// Request cancellation normally makes net/http close active connections.
+	// Closing the tracked sockets here also covers a stalled protocol read in a
+	// custom transport or dialer.
+	context.AfterFunc(requestContext, func() {
+		connectionTracker.closeAll()
+		client.CloseIdleConnections()
+	})
 
 	return &Session{
 		client:            client,
