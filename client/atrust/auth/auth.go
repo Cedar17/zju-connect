@@ -12,11 +12,11 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
-	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/mythologyli/zju-connect/client/authchallenge"
 	"github.com/mythologyli/zju-connect/log"
 )
 
@@ -90,7 +90,8 @@ type Session struct {
 	antiReplayRand string
 	ticket         string
 
-	response map[string]json.RawMessage
+	response         map[string]json.RawMessage
+	challengeHandler authchallenge.Handler
 }
 
 func NewSession(server string, dialContext ...func(context.Context, string, string) (net.Conn, error)) *Session {
@@ -230,9 +231,10 @@ type AuthInfo struct {
 }
 
 type LoginOptions struct {
-	DeviceID   string
-	Cookies    []Cookie
-	TOTPSecret string
+	DeviceID         string
+	Cookies          []Cookie
+	TOTPSecret       string
+	ChallengeHandler authchallenge.Handler
 }
 
 type LoginResult struct {
@@ -280,24 +282,17 @@ func (s *Session) withGraphCheckCode(process func(string) (int, error), graphCod
 			return err
 		}
 
-		var graphCheckCode string
-		if graphCodeFile != "" {
-			if writeErr := os.WriteFile(graphCodeFile, imgData, 0644); writeErr != nil {
-				log.Printf("Warning: failed to write graph code image to %s: %v", graphCodeFile, writeErr)
-			} else {
-				log.Printf("Graph check code saved to %s", graphCodeFile)
-			}
-
-			log.Print("Please enter the graph check code JSON: ")
-			_, err = fmt.Scanln(&graphCheckCode)
-			if err != nil {
-				return err
-			}
-		} else {
-			graphCheckCode, err = serveCaptchaInBrowser(imgData, 5*time.Minute)
-			if err != nil {
-				return fmt.Errorf("failed to get captcha input: %w", err)
-			}
+		captchaResponse, err := s.challengeHandler.HandleClickCaptcha(authchallenge.ClickCaptchaChallenge{
+			Image:      imgData,
+			OutputPath: graphCodeFile,
+			Message:    "Please enter the graph check code JSON:",
+		})
+		if err != nil {
+			return fmt.Errorf("complete aTrust captcha challenge: %w", err)
+		}
+		graphCheckCode, err := graphCheckCodeFromResponse(captchaResponse, imgData)
+		if err != nil {
+			return fmt.Errorf("encode aTrust captcha response: %w", err)
 		}
 
 		log.DebugPrintf("graphCheckCode submitted: %s", graphCheckCode)
@@ -416,6 +411,10 @@ func (s *Session) Login(method LoginMethod, opts LoginOptions) (LoginResult, err
 
 	s.deviceID = opts.DeviceID
 	s.totpSecret = opts.TOTPSecret
+	s.challengeHandler = opts.ChallengeHandler
+	if s.challengeHandler == nil {
+		s.challengeHandler = authchallenge.NewCLIHandler(authchallenge.CLIOptions{})
+	}
 	s.env = base64.StdEncoding.EncodeToString([]byte(`{"deviceId":"` + opts.DeviceID + `"}`))
 
 	isLogin, authInfoList, err := s.authConfig(false, true)

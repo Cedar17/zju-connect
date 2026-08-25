@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/mythologyli/zju-connect/client"
+	"github.com/mythologyli/zju-connect/client/authchallenge"
 	"github.com/mythologyli/zju-connect/internal/hook_func"
 	"github.com/mythologyli/zju-connect/internal/underlay"
 	"github.com/mythologyli/zju-connect/log"
@@ -59,6 +60,7 @@ type Client struct {
 	requestIPKeepAlive sync.Once
 	keepAliveStarted   sync.Once
 	closeOnce          sync.Once
+	challengeHandler   authchallenge.Handler
 }
 
 func NewClient(server, username, password, totpSecret string, tlsCert tls.Certificate, twfID string, testMultiLine, parseResource, useDomainResource bool) *Client {
@@ -77,9 +79,22 @@ func NewClient(server, username, password, totpSecret string, tlsCert tls.Certif
 		twfID:             twfID,
 		lifecycleCtx:      lifecycleCtx,
 		lifecycleCancel:   lifecycleCancel,
+		challengeHandler:  authchallenge.NewCLIHandler(authchallenge.CLIOptions{}),
 	}
 	c.setHTTPTransport(&tls.Config{InsecureSkipVerify: true})
 	return c
+}
+
+// SetChallengeHandler replaces the default CLI challenge handler while
+// preserving the historical Cedar constructor used by the Android fork.
+func (c *Client) SetChallengeHandler(handler authchallenge.Handler) {
+	if c == nil {
+		return
+	}
+	if handler == nil {
+		handler = authchallenge.NewCLIHandler(authchallenge.CLIOptions{})
+	}
+	c.challengeHandler = handler
 }
 
 // Close releases background resources held by the client. Safe to call

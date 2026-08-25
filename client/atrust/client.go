@@ -17,6 +17,7 @@ import (
 
 	"github.com/mythologyli/zju-connect/client"
 	"github.com/mythologyli/zju-connect/client/atrust/auth"
+	"github.com/mythologyli/zju-connect/client/authchallenge"
 	"github.com/mythologyli/zju-connect/internal/ipresource"
 	"github.com/mythologyli/zju-connect/internal/underlay"
 	"github.com/mythologyli/zju-connect/log"
@@ -61,8 +62,32 @@ type Client struct {
 	nodeTLSConfig   *tls.Config
 	setupStageMu    sync.RWMutex
 	setupStage      func(string)
+	authHandlerMu   sync.RWMutex
+	authHandler     authchallenge.Handler
 
 	skipTCPTunnelWait bool
+}
+
+// SetAuthenticationChallengeHandler replaces the default CLI challenge
+// handler used by the historical Setup API. Android authentication uses
+// auth.Session directly, but retaining this hook preserves PR #141 behavior
+// for callers that still authenticate through Client.Setup.
+func (c *Client) SetAuthenticationChallengeHandler(handler authchallenge.Handler) {
+	if c == nil {
+		return
+	}
+	c.authHandlerMu.Lock()
+	c.authHandler = handler
+	c.authHandlerMu.Unlock()
+}
+
+func (c *Client) authenticationChallengeHandler() authchallenge.Handler {
+	if c == nil {
+		return nil
+	}
+	c.authHandlerMu.RLock()
+	defer c.authHandlerMu.RUnlock()
+	return c.authHandler
 }
 
 func (c *Client) SetSkipTCPTunnelWait(skip bool) {
@@ -423,9 +448,10 @@ func (c *Client) SetupContext(ctx context.Context, serverAddress string, serverP
 		}
 
 		loginResult, err := sess.Login(loginMethod, auth.LoginOptions{
-			DeviceID:   c.DeviceID,
-			Cookies:    clientAuthData.Cookies,
-			TOTPSecret: totpSecret,
+			DeviceID:         c.DeviceID,
+			Cookies:          clientAuthData.Cookies,
+			TOTPSecret:       totpSecret,
+			ChallengeHandler: c.authenticationChallengeHandler(),
 		})
 		if err != nil {
 			log.Println("Login error:", err)
