@@ -1,1 +1,1 @@
-trigger caller-owned context validation
+rerun caller-owned context validation with preserved transport shape
