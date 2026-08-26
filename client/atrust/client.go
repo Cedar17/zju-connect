@@ -36,6 +36,7 @@ type ClientOptions struct {
 	Session         SessionOptions
 	UnderlayDialer  client.UnderlayDialer
 	TLSKeyLogWriter io.Writer
+	AuthTLSConfig   *tls.Config
 	NodeTLSConfig   *tls.Config
 }
 
@@ -85,6 +86,7 @@ type Client struct {
 	closeOnce        sync.Once
 	underlayDialer   client.UnderlayDialer
 	tlsKeyLogWriter  io.Writer
+	authTLSConfig    *tls.Config
 	nodeTLSConfig    *tls.Config
 	tcpTunnelZeroRTT bool
 }
@@ -98,6 +100,7 @@ func NewClient(options ClientOptions) *Client {
 		SignKey:         options.Session.SignKey,
 		underlayDialer:  options.UnderlayDialer,
 		tlsKeyLogWriter: options.TLSKeyLogWriter,
+		authTLSConfig:   cloneTLSConfig(options.AuthTLSConfig),
 		nodeTLSConfig:   cloneTLSConfig(options.NodeTLSConfig),
 		lifecycleCtx:    lifecycleCtx,
 		lifecycleCancel: lifecycleCancel,
@@ -338,7 +341,11 @@ func (c *Client) Setup(options SetupOptions) ([]byte, error) {
 	} else {
 		authServerHost = fmt.Sprintf("%s:%d", options.ServerAddress, options.ServerPort)
 	}
-	sess := auth.NewSession(authServerHost, c.tlsKeyLogWriter, c.underlayDialer.DialContext)
+	sess := auth.NewSessionWithOptions(authServerHost, auth.SessionOptions{
+		TLSConfig:       c.authTLSConfig,
+		TLSKeyLogWriter: c.tlsKeyLogWriter,
+		DialContext:     c.underlayDialer.DialContext,
+	})
 	serverVersionInfo, manifestErr := sess.ServerVersionInfo()
 	serverVersionInfo, err := resolveServerVersionInfo(clientAuthData.ServerVersionInfo, serverVersionInfo, manifestErr)
 	if err != nil {
