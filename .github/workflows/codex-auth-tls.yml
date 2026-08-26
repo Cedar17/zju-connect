@@ -1,0 +1,54 @@
+name: Apply caller-owned auth TLS candidate
+on: push
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: feat/atrust-caller-tls-config
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.25.6"
+      - name: Apply and validate auth TLS patch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          def replace(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one replacement, found {count}")
+              p.write_text(text.replace(old, new))
+
+          old = "func NewSession(server string, tlsKeyLogWriter io.Writer, dialContext ...client.DialContextFunc) *Session {\n\ttr := &http.Transport{\n\t\tTLSClientConfig: &tls.Config{\n\t\t\tInsecureSkipVerify: true,\n\t\t\tKeyLogWriter:       tlsKeyLogWriter,\n\t\t},\n\t}\n\tif len(dialContext) > 0 && dialContext[0] != nil {\n\t\ttr.DialContext = dialContext[0]\n\t}\n\tjar, _ := cookiejar.New(nil)\n\tclient := &http.Client{Transport: tr, Jar: jar, Timeout: 20 * time.Second}\n\n\treturn &Session{\n\t\tclient:   client,\n\t\tbaseHost: server,\n\t\tbaseURL:  \"https://\" + server,\n\t\trid:      base64.StdEncoding.EncodeToString([]byte(server)),\n\t\tresponse: make(map[string]json.RawMessage),\n\t}\n}\n"
+          new = "type SessionOptions struct {\n\tTLSConfig       *tls.Config\n\tTLSKeyLogWriter io.Writer\n\tDialContext     client.DialContextFunc\n}\n\nfunc NewSession(server string, tlsKeyLogWriter io.Writer, dialContext ...client.DialContextFunc) *Session {\n\toptions := SessionOptions{TLSKeyLogWriter: tlsKeyLogWriter}\n\tif len(dialContext) > 0 {\n\t\toptions.DialContext = dialContext[0]\n\t}\n\treturn NewSessionWithOptions(server, options)\n}\n\nfunc NewSessionWithOptions(server string, options SessionOptions) *Session {\n\ttlsConfig := options.TLSConfig\n\tif tlsConfig == nil {\n\t\ttlsConfig = &tls.Config{InsecureSkipVerify: true}\n\t} else {\n\t\ttlsConfig = tlsConfig.Clone()\n\t}\n\tif options.TLSKeyLogWriter != nil {\n\t\ttlsConfig.KeyLogWriter = options.TLSKeyLogWriter\n\t}\n\ttr := &http.Transport{TLSClientConfig: tlsConfig}\n\tif options.DialContext != nil {\n\t\ttr.DialContext = options.DialContext\n\t}\n\tjar, _ := cookiejar.New(nil)\n\thttpClient := &http.Client{Transport: tr, Jar: jar, Timeout: 20 * time.Second}\n\n\treturn &Session{\n\t\tclient:   httpClient,\n\t\tbaseHost: server,\n\t\tbaseURL:  \"https://\" + server,\n\t\trid:      base64.StdEncoding.EncodeToString([]byte(server)),\n\t\tresponse: make(map[string]json.RawMessage),\n\t}\n}\n"
+          replace("client/atrust/auth/auth.go", old, new)
+
+          replace("client/atrust/client.go", "\tTLSKeyLogWriter io.Writer\n\tNodeTLSConfig   *tls.Config\n", "\tTLSKeyLogWriter io.Writer\n\tAuthTLSConfig   *tls.Config\n\tNodeTLSConfig   *tls.Config\n")
+          replace("client/atrust/client.go", "\ttlsKeyLogWriter  io.Writer\n\tnodeTLSConfig    *tls.Config\n", "\ttlsKeyLogWriter  io.Writer\n\tauthTLSConfig    *tls.Config\n\tnodeTLSConfig    *tls.Config\n")
+          replace("client/atrust/client.go", "\t\ttlsKeyLogWriter: options.TLSKeyLogWriter,\n\t\tnodeTLSConfig:   cloneTLSConfig(options.NodeTLSConfig),", "\t\ttlsKeyLogWriter: options.TLSKeyLogWriter,\n\t\tauthTLSConfig:   cloneTLSConfig(options.AuthTLSConfig),\n\t\tnodeTLSConfig:   cloneTLSConfig(options.NodeTLSConfig),")
+          old = "\tsess := auth.NewSession(authServerHost, c.tlsKeyLogWriter, c.underlayDialer.DialContext)"
+          new = "\tsess := auth.NewSessionWithOptions(authServerHost, auth.SessionOptions{\n\t\tTLSConfig:       c.authTLSConfig,\n\t\tTLSKeyLogWriter: c.tlsKeyLogWriter,\n\t\tDialContext:     c.underlayDialer.DialContext,\n\t})"
+          replace("client/atrust/client.go", old, new)
+
+          Path("client/atrust/auth/session_options_test.go").write_text("package auth\n\nimport (\n\t\"crypto/tls\"\n\t\"net/http\"\n\t\"testing\"\n)\n\nfunc sessionTransportTLSConfig(t *testing.T, session *Session) *tls.Config {\n\tt.Helper()\n\ttransport, ok := session.client.Transport.(*http.Transport)\n\tif !ok || transport.TLSClientConfig == nil {\n\t\tt.Fatal(\"session transport does not expose TLS config\")\n\t}\n\treturn transport.TLSClientConfig\n}\n\nfunc TestNewSessionPreservesCompatibilityTLSDefault(t *testing.T) {\n\tgot := sessionTransportTLSConfig(t, NewSession(\"vpn.example\", nil))\n\tif !got.InsecureSkipVerify {\n\t\tt.Fatal(\"NewSession must preserve the existing insecure appliance-compatible default\")\n\t}\n}\n\nfunc TestNewSessionWithOptionsClonesCallerTLSConfig(t *testing.T) {\n\toriginal := &tls.Config{ServerName: \"vpn.example\"}\n\tsession := NewSessionWithOptions(\"vpn.example\", SessionOptions{TLSConfig: original})\n\toriginal.ServerName = \"mutated.example\"\n\tgot := sessionTransportTLSConfig(t, session)\n\tif got.ServerName != \"vpn.example\" {\n\t\tt.Fatalf(\"caller mutation leaked into session TLS config: %q\", got.ServerName)\n\t}\n\tif got.InsecureSkipVerify {\n\t\tt.Fatal(\"caller TLS policy was overwritten by compatibility defaults\")\n\t}\n}\n")
+          PY
+          gofmt -w client/atrust/auth/auth.go client/atrust/client.go client/atrust/auth/session_options_test.go
+          git diff --check
+          go test ./client/atrust/... ./internal/ping
+          go vet ./client/atrust/... ./internal/ping
+      - name: Commit validated candidate
+        shell: bash
+        run: |
+          rm .github/workflows/codex-auth-tls.yml
+          git config user.name "Cedar17"
+          git config user.email "108384960+Cedar17@users.noreply.github.com"
+          git add -A
+          git commit -m "feat(atrust): allow caller-owned auth TLS config"
+          git push origin HEAD:feat/atrust-caller-tls-config
