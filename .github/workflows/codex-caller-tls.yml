@@ -1,0 +1,225 @@
+name: Apply caller-owned node TLS candidate
+
+on:
+  push:
+    branches:
+      - feat/atrust-caller-tls-config
+    paths:
+      - .github/workflows/codex-caller-tls.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout candidate branch
+        uses: actions/checkout@v5
+        with:
+          ref: feat/atrust-caller-tls-config
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.25.6"
+
+      - name: Apply focused TLS patch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one replacement, found {count}: {old!r}")
+              p.write_text(text.replace(old, new))
+
+          replace(
+              "client/atrust/client.go",
+              '"crypto/rand"\n',
+              '"crypto/rand"\n\t"crypto/tls"\n',
+          )
+          replace(
+              "client/atrust/client.go",
+              "type ClientOptions struct {\n\tSession         SessionOptions\n\tUnderlayDialer  client.UnderlayDialer\n\tTLSKeyLogWriter io.Writer\n}",
+              "type ClientOptions struct {\n\tSession         SessionOptions\n\tUnderlayDialer  client.UnderlayDialer\n\tTLSKeyLogWriter io.Writer\n\tNodeTLSConfig   *tls.Config\n}",
+          )
+          replace(
+              "client/atrust/client.go",
+              "\tunderlayDialer   client.UnderlayDialer\n\ttlsKeyLogWriter  io.Writer\n\ttcpTunnelZeroRTT bool\n",
+              "\tunderlayDialer   client.UnderlayDialer\n\ttlsKeyLogWriter  io.Writer\n\tnodeTLSConfig    *tls.Config\n\ttcpTunnelZeroRTT bool\n",
+          )
+          replace(
+              "client/atrust/client.go",
+              "\t\tunderlayDialer:  options.UnderlayDialer,\n\t\ttlsKeyLogWriter: options.TLSKeyLogWriter,\n\t\tlifecycleCtx:    lifecycleCtx,",
+              "\t\tunderlayDialer:  options.UnderlayDialer,\n\t\ttlsKeyLogWriter: options.TLSKeyLogWriter,\n\t\tnodeTLSConfig:   cloneTLSConfig(options.NodeTLSConfig),\n\t\tlifecycleCtx:    lifecycleCtx,",
+          )
+          replace(
+              "client/atrust/client.go",
+              "c.BestNodes = getBestNodes(c.NodeGroups, c.underlayDialer.DialContext, c.tlsKeyLogWriter)",
+              "c.BestNodes = getBestNodes(c.NodeGroups, c.underlayDialer.DialContext, c.tlsKeyLogWriter, c.nodeTLSConfig)",
+          )
+
+          replace(
+              "client/atrust/tls.go",
+              "func tlsConfig(config *tls.Config, keyLogWriter io.Writer) *tls.Config {",
+              "func cloneTLSConfig(config *tls.Config) *tls.Config {\n\tif config == nil {\n\t\treturn nil\n\t}\n\treturn config.Clone()\n}\n\nfunc tlsConfig(config *tls.Config, keyLogWriter io.Writer) *tls.Config {",
+          )
+          replace(
+              "client/atrust/tls.go",
+              "// tunnelTLSConfig mirrors the official client's standard TLS transport.\nfunc tunnelTLSConfig(keyLogWriter io.Writer) *tls.Config {\n\treturn tlsConfig(&tls.Config{\n\t\tInsecureSkipVerify:     true,\n\t\tSessionTicketsDisabled: true,\n\t}, keyLogWriter)\n}\n",
+              "// tunnelTLSConfig mirrors the official client's standard TLS transport.\nfunc tunnelTLSConfig(keyLogWriter io.Writer) *tls.Config {\n\treturn tlsConfig(&tls.Config{\n\t\tInsecureSkipVerify:     true,\n\t\tSessionTicketsDisabled: true,\n\t}, keyLogWriter)\n}\n\nfunc (c *Client) nodeTLSConfigForDial(base *tls.Config) *tls.Config {\n\tif c == nil {\n\t\tif base != nil {\n\t\t\treturn tlsConfig(base, nil)\n\t\t}\n\t\treturn tunnelTLSConfig(nil)\n\t}\n\tif c.nodeTLSConfig != nil {\n\t\treturn tlsConfig(c.nodeTLSConfig, c.tlsKeyLogWriter)\n\t}\n\tif base != nil {\n\t\treturn tlsConfig(base, c.tlsKeyLogWriter)\n\t}\n\treturn tunnelTLSConfig(c.tlsKeyLogWriter)\n}\n",
+          )
+
+          replace(
+              "client/atrust/ip.go",
+              'dialTLSContext(ctx, c.underlayDialer, "tcp", addr, tunnelTLSConfig(c.tlsKeyLogWriter))',
+              'dialTLSContext(ctx, c.underlayDialer, "tcp", addr, c.nodeTLSConfigForDial(nil))',
+          )
+          replace(
+              "client/atrust/l3tunnel.go",
+              "dialTLSContext(ctx, aTrustClient.underlayDialer, network, address, tlsConfig(config, aTrustClient.tlsKeyLogWriter))",
+              "dialTLSContext(ctx, aTrustClient.underlayDialer, network, address, aTrustClient.nodeTLSConfigForDial(config))",
+          )
+          replace(
+              "client/atrust/tcptunnel.go",
+              'dialTLSContext(ctx, c.underlayDialer, "tcp", nodeAddr, tunnelTLSConfig(c.tlsKeyLogWriter))',
+              'dialTLSContext(ctx, c.underlayDialer, "tcp", nodeAddr, c.nodeTLSConfigForDial(nil))',
+          )
+
+          replace(
+              "client/atrust/node.go",
+              '"context"\n\t"io"',
+              '"context"\n\t"crypto/tls"\n\t"io"',
+          )
+          replace(
+              "client/atrust/node.go",
+              "func getBestNodes(nodeGroups map[string]NodeGroup, dialContext client.DialContextFunc, keyLogWriter io.Writer) map[string]string {\n\treturn selectBestNodes(nodeGroups, func(nodeGroups map[string][]string) map[string]string {\n\t\treturn getBestReachableNodes(nodeGroups, dialContext, keyLogWriter)\n\t})\n}",
+              "func getBestNodes(nodeGroups map[string]NodeGroup, dialContext client.DialContextFunc, keyLogWriter io.Writer, nodeTLSConfig *tls.Config) map[string]string {\n\treturn selectBestNodes(nodeGroups, func(nodeGroups map[string][]string) map[string]string {\n\t\treturn getBestReachableNodes(nodeGroups, dialContext, keyLogWriter, nodeTLSConfig)\n\t})\n}",
+          )
+          replace(
+              "client/atrust/node.go",
+              "func getBestReachableNodes(nodeGroups map[string][]string, dialContext client.DialContextFunc, keyLogWriter io.Writer) map[string]string {",
+              "func getBestReachableNodes(nodeGroups map[string][]string, dialContext client.DialContextFunc, keyLogWriter io.Writer, nodeTLSConfig *tls.Config) map[string]string {",
+          )
+          replace(
+              "client/atrust/node.go",
+              "\t\t\t\ttcping.SetDialContext(dialContext)\n\t\t\t\ttcping.SetKeyLogWriter(keyLogWriter)\n",
+              "\t\t\t\ttcping.SetDialContext(dialContext)\n\t\t\t\ttcping.SetKeyLogWriter(keyLogWriter)\n\t\t\t\ttcping.SetTLSConfig(nodeTLSConfig)\n",
+          )
+          replace(
+              "client/atrust/node.go",
+              "bestNodes := getBestNodes(c.NodeGroups, c.underlayDialer.DialContext, c.tlsKeyLogWriter)",
+              "bestNodes := getBestNodes(c.NodeGroups, c.underlayDialer.DialContext, c.tlsKeyLogWriter, c.nodeTLSConfig)",
+          )
+
+          replace(
+              "internal/ping/tcp.go",
+              "\tdial   client.DialContextFunc\n\tkeyLog io.Writer\n",
+              "\tdial      client.DialContextFunc\n\tkeyLog    io.Writer\n\ttlsConfig *tls.Config\n",
+          )
+          replace(
+              "internal/ping/tcp.go",
+              "// SetKeyLogWriter records probe TLS secrets in NSS key log format.\nfunc (tcping *TCPing) SetKeyLogWriter(writer io.Writer) {\n\ttcping.keyLog = writer\n}\n",
+              "// SetKeyLogWriter records probe TLS secrets in NSS key log format.\nfunc (tcping *TCPing) SetKeyLogWriter(writer io.Writer) {\n\ttcping.keyLog = writer\n}\n\n// SetTLSConfig overrides the default probe TLS policy. The config is cloned so\n// callers can safely reuse or modify their copy after configuration.\nfunc (tcping *TCPing) SetTLSConfig(config *tls.Config) {\n\tif config == nil {\n\t\ttcping.tlsConfig = nil\n\t\treturn\n\t}\n\ttcping.tlsConfig = config.Clone()\n}\n\nfunc (tcping *TCPing) tlsConfigForTarget() *tls.Config {\n\tconfig := &tls.Config{\n\t\tServerName:         tcping.target.Host,\n\t\tInsecureSkipVerify: true,\n\t\tKeyLogWriter:       tcping.keyLog,\n\t}\n\tif tcping.tlsConfig == nil {\n\t\treturn config\n\t}\n\tconfig = tcping.tlsConfig.Clone()\n\tif config.ServerName == \"\" {\n\t\tconfig.ServerName = tcping.target.Host\n\t}\n\tif tcping.keyLog != nil {\n\t\tconfig.KeyLogWriter = tcping.keyLog\n\t}\n\treturn config\n}\n",
+          )
+          replace(
+              "internal/ping/tcp.go",
+              "\ttlsConn := tls.Client(conn, &tls.Config{\n\t\tServerName:         tcping.target.Host,\n\t\tInsecureSkipVerify: true,\n\t\tKeyLogWriter:       tcping.keyLog,\n\t})",
+              "\ttlsConn := tls.Client(conn, tcping.tlsConfigForTarget())",
+          )
+
+          Path("client/atrust/tls_config_test.go").write_text(r'''package atrust
+
+import (
+    "crypto/tls"
+    "testing"
+)
+
+func TestNodeTLSConfigDefaultsToOfficialClientPolicy(t *testing.T) {
+    c := NewClient(ClientOptions{})
+    got := c.nodeTLSConfigForDial(nil)
+    if !got.InsecureSkipVerify {
+        t.Fatal("default node TLS config must preserve InsecureSkipVerify compatibility")
+    }
+    if !got.SessionTicketsDisabled {
+        t.Fatal("default node TLS config must preserve disabled session tickets")
+    }
+}
+
+func TestNodeTLSConfigIsCloned(t *testing.T) {
+    original := &tls.Config{
+        InsecureSkipVerify: true,
+        ServerName:         "node.example",
+    }
+    c := NewClient(ClientOptions{NodeTLSConfig: original})
+    original.ServerName = "mutated.example"
+
+    first := c.nodeTLSConfigForDial(nil)
+    if first.ServerName != "node.example" {
+        t.Fatalf("client retained caller mutation: got %q", first.ServerName)
+    }
+    first.ServerName = "returned.example"
+    second := c.nodeTLSConfigForDial(nil)
+    if second.ServerName != "node.example" {
+        t.Fatalf("returned config mutated client state: got %q", second.ServerName)
+    }
+}
+''')
+
+          Path("internal/ping/tcp_tls_config_test.go").write_text(r'''package ping
+
+import (
+    "crypto/tls"
+    "testing"
+)
+
+func TestTCPingTLSConfigDefaultAndClone(t *testing.T) {
+    p := NewTCPing()
+    p.SetTarget(&Target{Host: "node.example"})
+
+    defaultConfig := p.tlsConfigForTarget()
+    if !defaultConfig.InsecureSkipVerify || defaultConfig.ServerName != "node.example" {
+        t.Fatalf("unexpected default TLS config: %+v", defaultConfig)
+    }
+
+    custom := &tls.Config{InsecureSkipVerify: true, ServerName: "pinned.example"}
+    p.SetTLSConfig(custom)
+    custom.ServerName = "mutated.example"
+    got := p.tlsConfigForTarget()
+    if got.ServerName != "pinned.example" {
+        t.Fatalf("TLS config was not cloned: got %q", got.ServerName)
+    }
+}
+''')
+          PY
+
+          gofmt -w \
+            client/atrust/client.go \
+            client/atrust/tls.go \
+            client/atrust/ip.go \
+            client/atrust/l3tunnel.go \
+            client/atrust/node.go \
+            client/atrust/tcptunnel.go \
+            client/atrust/tls_config_test.go \
+            internal/ping/tcp.go \
+            internal/ping/tcp_tls_config_test.go
+
+          git diff --check
+          go test ./client/atrust/... ./internal/ping
+          go vet ./client/atrust/... ./internal/ping
+
+      - name: Commit validated candidate
+        shell: bash
+        run: |
+          rm .github/workflows/codex-caller-tls.yml
+          git config user.name "Cedar17"
+          git config user.email "108384960+Cedar17@users.noreply.github.com"
+          git add -A
+          git commit -m "feat(atrust): allow caller-owned node TLS config"
+          git push origin HEAD:feat/atrust-caller-tls-config
