@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -35,6 +36,7 @@ type ClientOptions struct {
 	Session         SessionOptions
 	UnderlayDialer  client.UnderlayDialer
 	TLSKeyLogWriter io.Writer
+	NodeTLSConfig   *tls.Config
 }
 
 type SetupOptions struct {
@@ -83,6 +85,7 @@ type Client struct {
 	closeOnce        sync.Once
 	underlayDialer   client.UnderlayDialer
 	tlsKeyLogWriter  io.Writer
+	nodeTLSConfig    *tls.Config
 	tcpTunnelZeroRTT bool
 }
 
@@ -95,6 +98,7 @@ func NewClient(options ClientOptions) *Client {
 		SignKey:         options.Session.SignKey,
 		underlayDialer:  options.UnderlayDialer,
 		tlsKeyLogWriter: options.TLSKeyLogWriter,
+		nodeTLSConfig:   cloneTLSConfig(options.NodeTLSConfig),
 		lifecycleCtx:    lifecycleCtx,
 		lifecycleCancel: lifecycleCancel,
 	}
@@ -404,7 +408,7 @@ func (c *Client) Setup(options SetupOptions) ([]byte, error) {
 
 	log.DebugPrintf("SID: %s, DeviceID: %s, ConnectionID: %s, SignKey: %s", c.SID, c.DeviceID, c.ConnectionID, c.SignKey)
 
-	c.BestNodes = getBestNodes(c.NodeGroups, c.underlayDialer.DialContext, c.tlsKeyLogWriter)
+	c.BestNodes = getBestNodes(c.NodeGroups, c.underlayDialer.DialContext, c.tlsKeyLogWriter, c.nodeTLSConfig)
 
 	err = c.getIP()
 	if err != nil {
