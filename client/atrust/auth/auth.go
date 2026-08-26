@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -91,6 +92,7 @@ func (i ServerVersionInfo) TCPTunnelZeroRTT() bool {
 }
 
 type Session struct {
+	ctx        context.Context
 	client     *http.Client
 	deviceID   string
 	username   string
@@ -112,6 +114,7 @@ type Session struct {
 }
 
 type SessionOptions struct {
+	Context         context.Context
 	TLSConfig       *tls.Config
 	TLSKeyLogWriter io.Writer
 	DialContext     client.DialContextFunc
@@ -125,7 +128,19 @@ func NewSession(server string, tlsKeyLogWriter io.Writer, dialContext ...client.
 	return NewSessionWithOptions(server, options)
 }
 
+func NewSessionContext(ctx context.Context, server string, tlsKeyLogWriter io.Writer, dialContext ...client.DialContextFunc) *Session {
+	options := SessionOptions{Context: ctx, TLSKeyLogWriter: tlsKeyLogWriter}
+	if len(dialContext) > 0 {
+		options.DialContext = dialContext[0]
+	}
+	return NewSessionWithOptions(server, options)
+}
+
 func NewSessionWithOptions(server string, options SessionOptions) *Session {
+	ctx := options.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	tlsConfig := options.TLSConfig
 	if tlsConfig == nil {
 		tlsConfig = &tls.Config{InsecureSkipVerify: true}
@@ -143,12 +158,21 @@ func NewSessionWithOptions(server string, options SessionOptions) *Session {
 	httpClient := &http.Client{Transport: tr, Jar: jar, Timeout: 20 * time.Second}
 
 	return &Session{
+		ctx:      ctx,
 		client:   httpClient,
 		baseHost: server,
 		baseURL:  "https://" + server,
 		rid:      base64.StdEncoding.EncodeToString([]byte(server)),
 		response: make(map[string]json.RawMessage),
 	}
+}
+
+func (s *Session) do(req *http.Request) (*http.Response, error) {
+	ctx := s.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return s.client.Do(req.WithContext(ctx))
 }
 
 type AuthInfo struct {

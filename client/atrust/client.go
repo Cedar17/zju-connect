@@ -318,6 +318,20 @@ func SetTrusted(serverAddress string, serverPort int, authData []byte, trusted b
 }
 
 func (c *Client) Setup(options SetupOptions) ([]byte, error) {
+	return c.SetupContext(context.Background(), options)
+}
+
+func (c *Client) SetupContext(ctx context.Context, options SetupOptions) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	setupCtx, cancelSetup := context.WithCancel(ctx)
+	defer cancelSetup()
+	stopLifecycleCancellation := context.AfterFunc(c.lifecycleCtx, cancelSetup)
+	defer stopLifecycleCancellation()
+	if err := setupCtx.Err(); err != nil {
+		return nil, err
+	}
 	if c.underlayDialer == nil {
 		return nil, errors.New("underlay dialer is required")
 	}
@@ -342,6 +356,7 @@ func (c *Client) Setup(options SetupOptions) ([]byte, error) {
 		authServerHost = fmt.Sprintf("%s:%d", options.ServerAddress, options.ServerPort)
 	}
 	sess := auth.NewSessionWithOptions(authServerHost, auth.SessionOptions{
+		Context:         setupCtx,
 		TLSConfig:       c.authTLSConfig,
 		TLSKeyLogWriter: c.tlsKeyLogWriter,
 		DialContext:     c.underlayDialer.DialContext,
@@ -415,14 +430,20 @@ func (c *Client) Setup(options SetupOptions) ([]byte, error) {
 
 	log.DebugPrintf("SID: %s, DeviceID: %s, ConnectionID: %s, SignKey: %s", c.SID, c.DeviceID, c.ConnectionID, c.SignKey)
 
-	c.BestNodes = getBestNodes(c.NodeGroups, c.underlayDialer.DialContext, c.tlsKeyLogWriter, c.nodeTLSConfig)
+	c.BestNodes = getBestNodes(setupCtx, c.NodeGroups, c.underlayDialer.DialContext, c.tlsKeyLogWriter, c.nodeTLSConfig)
+	if err := setupCtx.Err(); err != nil {
+		return nil, err
+	}
 
-	err = c.getIP()
+	err = c.getIP(setupCtx)
 	if err != nil {
 		return nil, err
 	}
 	c.underlayDialer.ExcludeIP(c.ip)
 
+	if err := setupCtx.Err(); err != nil {
+		return nil, err
+	}
 	l3Tunnel, err := NewL3Tunnel(c)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create L3 tunnel: %v", err)
