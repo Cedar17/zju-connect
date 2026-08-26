@@ -1,0 +1,71 @@
+name: Combine TLS and context candidates
+on: push
+permissions:
+  contents: write
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: integration/atrust-android-consumer
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.25.6"
+      - name: Apply context layer on TLS candidate
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          def replace(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one replacement, found {count}")
+              p.write_text(text.replace(old, new))
+
+          replace('client/atrust/auth/auth.go', 'import (\n\t"crypto/tls"', 'import (\n\t"context"\n\t"crypto/tls"')
+          replace('client/atrust/auth/auth.go', 'type Session struct {\n\tclient     *http.Client', 'type Session struct {\n\tctx        context.Context\n\tclient     *http.Client')
+          replace('client/atrust/auth/auth.go', 'type SessionOptions struct {\n\tTLSConfig       *tls.Config', 'type SessionOptions struct {\n\tContext         context.Context\n\tTLSConfig       *tls.Config')
+          replace('client/atrust/auth/auth.go', 'func NewSessionWithOptions(server string, options SessionOptions) *Session {\n\ttlsConfig := options.TLSConfig', 'func NewSessionContext(ctx context.Context, server string, tlsKeyLogWriter io.Writer, dialContext ...client.DialContextFunc) *Session {\n\toptions := SessionOptions{Context: ctx, TLSKeyLogWriter: tlsKeyLogWriter}\n\tif len(dialContext) > 0 {\n\t\toptions.DialContext = dialContext[0]\n\t}\n\treturn NewSessionWithOptions(server, options)\n}\n\nfunc NewSessionWithOptions(server string, options SessionOptions) *Session {\n\tctx := options.Context\n\tif ctx == nil {\n\t\tctx = context.Background()\n\t}\n\ttlsConfig := options.TLSConfig')
+          replace('client/atrust/auth/auth.go', '\treturn &Session{\n\t\tclient:   httpClient,', '\treturn &Session{\n\t\tctx:      ctx,\n\t\tclient:   httpClient,')
+          marker = '\t}\n}\n\ntype AuthInfo struct {'
+          insert = '\t}\n}\n\nfunc (s *Session) do(req *http.Request) (*http.Response, error) {\n\tctx := s.ctx\n\tif ctx == nil {\n\t\tctx = context.Background()\n\t}\n\treturn s.client.Do(req.WithContext(ctx))\n}\n\ntype AuthInfo struct {'
+          replace('client/atrust/auth/auth.go', marker, insert)
+          for p in Path('client/atrust/auth').glob('*.go'):
+              if p.name.endswith('_test.go'):
+                  continue
+              text = p.read_text().replace('s.client.Do(req)', 's.do(req)')
+              p.write_text(text)
+
+          replace('client/atrust/client.go', 'func (c *Client) Setup(options SetupOptions) ([]byte, error) {\n\tif c.underlayDialer == nil {', 'func (c *Client) Setup(options SetupOptions) ([]byte, error) {\n\treturn c.SetupContext(context.Background(), options)\n}\n\nfunc (c *Client) SetupContext(ctx context.Context, options SetupOptions) ([]byte, error) {\n\tif ctx == nil {\n\t\tctx = context.Background()\n\t}\n\tsetupCtx, cancelSetup := context.WithCancel(ctx)\n\tdefer cancelSetup()\n\tstopLifecycleCancellation := context.AfterFunc(c.lifecycleCtx, cancelSetup)\n\tdefer stopLifecycleCancellation()\n\tif err := setupCtx.Err(); err != nil {\n\t\treturn nil, err\n\t}\n\tif c.underlayDialer == nil {')
+          replace('client/atrust/client.go', '\tsess := auth.NewSessionWithOptions(authServerHost, auth.SessionOptions{\n\t\tTLSConfig:       c.authTLSConfig,', '\tsess := auth.NewSessionWithOptions(authServerHost, auth.SessionOptions{\n\t\tContext:         setupCtx,\n\t\tTLSConfig:       c.authTLSConfig,')
+          replace('client/atrust/client.go', '\tc.BestNodes = getBestNodes(c.NodeGroups, c.underlayDialer.DialContext, c.tlsKeyLogWriter, c.nodeTLSConfig)\n\n\terr = c.getIP()', '\tc.BestNodes = getBestNodes(setupCtx, c.NodeGroups, c.underlayDialer.DialContext, c.tlsKeyLogWriter, c.nodeTLSConfig)\n\tif err := setupCtx.Err(); err != nil {\n\t\treturn nil, err\n\t}\n\n\terr = c.getIP(setupCtx)')
+          replace('client/atrust/client.go', '\tl3Tunnel, err := NewL3Tunnel(c)', '\tif err := setupCtx.Err(); err != nil {\n\t\treturn nil, err\n\t}\n\tl3Tunnel, err := NewL3Tunnel(c)')
+
+          replace('client/atrust/ip.go', 'func (c *Client) getIP() error {', 'func (c *Client) getIP(parent context.Context) error {')
+          replace('client/atrust/ip.go', '\tctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)', '\tif parent == nil {\n\t\tparent = context.Background()\n\t}\n\tctx, cancel := context.WithTimeout(parent, 10*time.Second)')
+
+          replace('client/atrust/node.go', 'func getBestNodes(nodeGroups map[string]NodeGroup, dialContext client.DialContextFunc, keyLogWriter io.Writer, nodeTLSConfig *tls.Config) map[string]string {\n\treturn selectBestNodes(nodeGroups, func(nodeGroups map[string][]string) map[string]string {\n\t\treturn getBestReachableNodes(nodeGroups, dialContext, keyLogWriter, nodeTLSConfig)\n\t})\n}', 'func getBestNodes(ctx context.Context, nodeGroups map[string]NodeGroup, dialContext client.DialContextFunc, keyLogWriter io.Writer, nodeTLSConfig *tls.Config) map[string]string {\n\treturn selectBestNodes(nodeGroups, func(nodeGroups map[string][]string) map[string]string {\n\t\treturn getBestReachableNodes(ctx, nodeGroups, dialContext, keyLogWriter, nodeTLSConfig)\n\t})\n}')
+          replace('client/atrust/node.go', 'func getBestReachableNodes(nodeGroups map[string][]string, dialContext client.DialContextFunc, keyLogWriter io.Writer, nodeTLSConfig *tls.Config) map[string]string {', 'func getBestReachableNodes(ctx context.Context, nodeGroups map[string][]string, dialContext client.DialContextFunc, keyLogWriter io.Writer, nodeTLSConfig *tls.Config) map[string]string {\n\tif ctx == nil {\n\t\tctx = context.Background()\n\t}')
+          replace('client/atrust/node.go', '\t\t\t\tch := tcping.Start()', '\t\t\t\tch := tcping.StartWithContext(ctx)')
+          replace('client/atrust/node.go', '\t\tbestNodes := getBestNodes(c.NodeGroups, c.underlayDialer.DialContext, c.tlsKeyLogWriter, c.nodeTLSConfig)', '\t\tbestNodes := getBestNodes(ctx, c.NodeGroups, c.underlayDialer.DialContext, c.tlsKeyLogWriter, c.nodeTLSConfig)')
+
+          Path('client/atrust/auth/session_context_test.go').write_text('package auth\n\nimport (\n\t\"context\"\n\t\"errors\"\n\t\"net/http\"\n\t\"testing\"\n\t\"time\"\n)\n\ntype blockingRoundTripper struct{}\n\nfunc (blockingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {\n\t<-req.Context().Done()\n\treturn nil, req.Context().Err()\n}\n\nfunc TestSessionOptionsContextCancelsRequest(t *testing.T) {\n\tctx, cancel := context.WithCancel(context.Background())\n\tsession := NewSessionWithOptions(\"vpn.example\", SessionOptions{Context: ctx})\n\tsession.client.Transport = blockingRoundTripper{}\n\treq, err := http.NewRequest(http.MethodGet, \"https://example.invalid\", nil)\n\tif err != nil { t.Fatal(err) }\n\tdone := make(chan error, 1)\n\tgo func() { _, err := session.do(req); done <- err }()\n\tcancel()\n\tselect {\n\tcase err := <-done:\n\t\tif !errors.Is(err, context.Canceled) { t.Fatalf(\"got %v, want context.Canceled\", err) }\n\tcase <-time.After(time.Second):\n\t\tt.Fatal(\"request did not observe session cancellation\")\n\t}\n}\n')
+          Path('client/atrust/setup_context_test.go').write_text('package atrust\n\nimport (\n\t\"context\"\n\t\"errors\"\n\t\"net\"\n\t\"testing\"\n\t\"time\"\n)\n\ntype blockingUnderlayDialer struct{}\nfunc (blockingUnderlayDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) { <-ctx.Done(); return nil, ctx.Err() }\nfunc (blockingUnderlayDialer) ExcludeIP(net.IP) {}\n\nfunc TestSetupContextCancellationReachesManifestDial(t *testing.T) {\n\tclient := NewClient(ClientOptions{UnderlayDialer: blockingUnderlayDialer{}})\n\tctx, cancel := context.WithCancel(context.Background())\n\tdone := make(chan error, 1)\n\tgo func() { _, err := client.SetupContext(ctx, SetupOptions{ServerAddress: \"vpn.example\", ServerPort: 443}); done <- err }()\n\ttime.Sleep(20 * time.Millisecond); cancel()\n\tselect {\n\tcase err := <-done:\n\t\tif !errors.Is(err, context.Canceled) { t.Fatalf(\"got %v, want context.Canceled\", err) }\n\tcase <-time.After(time.Second): t.Fatal(\"SetupContext did not cancel in-flight manifest dial\")\n\t}\n}\n\nfunc TestClientCloseCancelsSetupContext(t *testing.T) {\n\tclient := NewClient(ClientOptions{UnderlayDialer: blockingUnderlayDialer{}})\n\tdone := make(chan error, 1)\n\tgo func() { _, err := client.SetupContext(context.Background(), SetupOptions{ServerAddress: \"vpn.example\", ServerPort: 443}); done <- err }()\n\ttime.Sleep(20 * time.Millisecond); client.Close()\n\tselect {\n\tcase err := <-done:\n\t\tif !errors.Is(err, context.Canceled) { t.Fatalf(\"got %v, want context.Canceled\", err) }\n\tcase <-time.After(time.Second): t.Fatal(\"Client.Close did not cancel in-flight setup\")\n\t}\n}\n')
+          PY
+          gofmt -w client/atrust/auth client/atrust/client.go client/atrust/ip.go client/atrust/node.go client/atrust/setup_context_test.go
+          git diff --check
+          go test ./client/atrust/... ./internal/ping
+          go vet ./client/atrust/... ./internal/ping
+      - name: Commit integration candidate
+        shell: bash
+        run: |
+          rm .github/workflows/codex-integrate-context.yml
+          git config user.name "Cedar17"
+          git config user.email "108384960+Cedar17@users.noreply.github.com"
+          git add -A
+          git commit -m "test(atrust): combine caller TLS and context seams"
+          git push origin HEAD:integration/atrust-android-consumer
